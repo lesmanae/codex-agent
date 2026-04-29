@@ -507,6 +507,69 @@ async def rotate_to_next() -> AuthInfo | None:
         return info
 
 
+async def set_active_account(name: str) -> AuthInfo:
+    """Promote a saved backup to the active auth.json + update state.
+
+    Raises FileNotFoundError if no such backup exists.
+    """
+    async with _global_lock:
+        info = await _swap_to(name)
+        state = await _read_state()
+        state.active = name
+        if name not in state.order:
+            state.order.append(name)
+        # Clear the exhausted flag — operator explicitly asked for this one.
+        state.exhausted_until.pop(name, None)
+        await _write_state(state)
+        return info
+
+
+async def delete_account(name: str) -> bool:
+    """Remove a saved backup and scrub it from rotation state.
+
+    If the deleted account was active, swap to the next available backup
+    (or clear auth.json if none). Returns True if a backup file was
+    actually removed.
+    """
+    if not _NAME_RE.match(name):
+        raise ValueError(f"invalid account name: {name!r}")
+    async with _global_lock:
+        backup_path = f"{ACCOUNTS_DIR}/{name}.json"
+        rc_exists, _, _ = await _run(*_nsenter("test", "-f", backup_path), timeout=5)
+        existed = rc_exists == 0
+        await _run(*_nsenter("rm", "-f", backup_path), timeout=5)
+
+        state = await _read_state()
+        was_active = state.active == name
+        state.order = [n for n in state.order if n != name]
+        state.exhausted_until.pop(name, None)
+        state.last_used.pop(name, None)
+        if was_active:
+            state.active = None
+        await _write_state(state)
+
+        if was_active:
+            # Best-effort fallback: pick the first remaining backup.
+            remaining = await _list_backup_files()
+            if remaining:
+                fallback = remaining[0]
+                try:
+                    await _swap_to(fallback)
+                    state = await _read_state()
+                    state.active = fallback
+                    if fallback not in state.order:
+                        state.order.append(fallback)
+                    await _write_state(state)
+                except Exception:  # noqa: BLE001
+                    logger.exception("fallback_swap_failed", name=fallback)
+            else:
+                # No accounts left at all — drop auth.json so the runner's
+                # next call surfaces a clear "no account" error.
+                await _run(*_nsenter("rm", "-f", AUTH_PATH), timeout=5)
+
+        return existed
+
+
 async def initialize_active_from_disk() -> None:
     """On bot startup, ensure /root/.codex/auth.json matches the recorded active.
 
