@@ -303,39 +303,59 @@ async def _kill_codex_login() -> None:
 async def start_login(*, user_id: int) -> PendingLogin:
     global _pending
     async with _global_lock:
-        await _kill_codex_login()
-        initial_mtime = await auth_mtime()
-        await _run(*_nsenter("bash", "-lc", f": > {LOGIN_LOG}"), timeout=5)
+        try:
+            await _kill_codex_login()
+            initial_mtime = await auth_mtime()
+            await _run(*_nsenter("bash", "-lc", f": > {LOGIN_LOG}"), timeout=5)
 
-        spawn_cmd = _nsenter(
-            "bash", "-lc",
-            f"nohup codex login > {LOGIN_LOG} 2>&1 & disown; echo OK",
-        )
-        rc, out, err = await _run(*spawn_cmd, timeout=10)
-        if rc != 0:
-            raise RuntimeError(f"failed to start codex login: {err.strip() or out.strip() or rc}")
+            spawn_cmd = _nsenter(
+                "bash", "-lc",
+                f"nohup codex login > {LOGIN_LOG} 2>&1 & disown; echo OK",
+            )
+            rc, out, err = await _run(*spawn_cmd, timeout=15)
+            logger.info(
+                "codex_login_spawn",
+                rc=rc,
+                out=out.strip()[:200],
+                err=err.strip()[:200],
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f"failed to start codex login (rc={rc}): "
+                    f"{err.strip() or out.strip() or 'no output'}"
+                )
 
-        url: str | None = None
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            rc, log, _ = await _run(*_nsenter("cat", LOGIN_LOG), timeout=5)
-            if rc == 0:
-                m = re.search(r"https://auth\.openai\.com/oauth/authorize[^\s]+", log)
-                if m:
-                    url = m.group(0)
-                    break
-            await asyncio.sleep(0.5)
+            url: str | None = None
+            last_log = ""
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                rc_cat, log, err_cat = await _run(*_nsenter("cat", LOGIN_LOG), timeout=5)
+                if rc_cat == 0:
+                    last_log = log
+                    m = re.search(r"https://auth\.openai\.com/oauth/authorize[^\s]+", log)
+                    if m:
+                        url = m.group(0)
+                        break
+                await asyncio.sleep(0.5)
 
-        if not url:
-            raise RuntimeError("codex login started but no auth URL appeared in log within 10s")
+            if not url:
+                preview = last_log.strip().replace("
+", " | ")[:300] or "<empty>"
+                raise RuntimeError(
+                    f"codex login started but no auth URL appeared in log within 20s. "
+                    f"log preview: {preview}"
+                )
 
-        _pending = PendingLogin(
-            user_id=user_id,
-            started_at=time.monotonic(),
-            url=url,
-            initial_mtime=initial_mtime,
-        )
-        return _pending
+            _pending = PendingLogin(
+                user_id=user_id,
+                started_at=time.monotonic(),
+                url=url,
+                initial_mtime=initial_mtime,
+            )
+            return _pending
+        except Exception:
+            logger.exception("codex_login_start_failed")
+            raise
 
 
 async def complete_login(callback_url: str) -> tuple[AuthInfo, str]:
