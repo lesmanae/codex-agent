@@ -11,6 +11,7 @@ services:
       - .env
     volumes:
       - ./data:/data
+      - ./skills:/app/skills  # writable so /api/skills CRUD persists
       - /:/host             # host filesystem available at /host (read-write)
     logging:
       driver: json-file

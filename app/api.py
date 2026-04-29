@@ -62,6 +62,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator
 
@@ -79,6 +80,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -200,6 +202,25 @@ class TurnStateOut(BaseModel):
 class SkillOut(BaseModel):
     name: str
     summary: str
+
+
+class SkillDetailOut(BaseModel):
+    name: str
+    summary: str
+    content: str
+
+
+class SkillUpsertRequest(BaseModel):
+    content: str = Field(min_length=1)
+
+
+class SkillCreateRequest(SkillUpsertRequest):
+    name: str = Field(min_length=1, max_length=64)
+
+
+class PinChangeRequest(BaseModel):
+    current_pin: str
+    new_pin: str = Field(min_length=4, max_length=64)
 
 
 # ---------------------------------------------------------------------------
@@ -594,9 +615,114 @@ def _register_routes(app: FastAPI) -> None:
 
     # ------ skills --------------------------------------------------------
 
+    _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+    def _slug_skill(name: str) -> str:
+        s = (name or "").strip().lower().replace(" ", "-")
+        s = re.sub(r"[^a-z0-9_-]", "", s)
+        return s
+
+    def _reload_skills() -> list[Skill]:
+        skills = load_skills(state.settings.skills_dir)
+        state.skills = skills
+        logger.info("skills_reloaded", count=len(skills), names=[s.name for s in skills])
+        return skills
+
     @app.get("/api/skills", response_model=list[SkillOut])
     async def list_skills(_: dict = Depends(require_token)) -> list[SkillOut]:
         return [SkillOut(name=s.name, summary=s.summary) for s in state.skills]
+
+    @app.get("/api/skills/{name}", response_model=SkillDetailOut)
+    async def get_skill(
+        name: str, _: dict = Depends(require_token)
+    ) -> SkillDetailOut:
+        slug = _slug_skill(name)
+        for s in state.skills:
+            if s.name == slug:
+                return SkillDetailOut(name=s.name, summary=s.summary, content=s.skill_md)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "skill not found")
+
+    @app.post("/api/skills", response_model=SkillDetailOut, status_code=201)
+    async def create_skill(
+        req: SkillCreateRequest, _: dict = Depends(require_token)
+    ) -> SkillDetailOut:
+        slug = _slug_skill(req.name)
+        if not slug or not _SKILL_NAME_RE.match(slug):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid skill name")
+        skill_dir = state.settings.skills_dir / slug
+        if skill_dir.exists():
+            raise HTTPException(status.HTTP_409_CONFLICT, "skill already exists")
+        skill_dir.mkdir(parents=True, exist_ok=False)
+        (skill_dir / "SKILL.md").write_text(req.content, encoding="utf-8")
+        skills = _reload_skills()
+        for s in skills:
+            if s.name == slug:
+                return SkillDetailOut(name=s.name, summary=s.summary, content=s.skill_md)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "skill not loaded after write")
+
+    @app.put("/api/skills/{name}", response_model=SkillDetailOut)
+    async def update_skill(
+        name: str,
+        req: SkillUpsertRequest,
+        _: dict = Depends(require_token),
+    ) -> SkillDetailOut:
+        slug = _slug_skill(name)
+        skill_dir = state.settings.skills_dir / slug
+        if not skill_dir.is_dir():
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "skill not found")
+        (skill_dir / "SKILL.md").write_text(req.content, encoding="utf-8")
+        skills = _reload_skills()
+        for s in skills:
+            if s.name == slug:
+                return SkillDetailOut(name=s.name, summary=s.summary, content=s.skill_md)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "skill not loaded after write")
+
+    @app.delete("/api/skills/{name}", status_code=204)
+    async def delete_skill(
+        name: str, _: dict = Depends(require_token)
+    ) -> Response:
+        slug = _slug_skill(name)
+        skill_dir = state.settings.skills_dir / slug
+        if not skill_dir.is_dir():
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "skill not found")
+        import shutil
+        shutil.rmtree(skill_dir)
+        _reload_skills()
+        return Response(status_code=204)
+
+    # ------ PIN management ----------------------------------------------
+
+    @app.post("/api/auth/pin", status_code=204)
+    async def change_pin(
+        req: PinChangeRequest, _: dict = Depends(require_token)
+    ) -> Response:
+        if req.current_pin != state.settings.api_pin:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "PIN saat ini salah")
+        new_pin = req.new_pin.strip()
+        if not new_pin:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "PIN baru kosong")
+        # Persist to /host/opt/codex-agent/.env (the file env_file in compose).
+        env_path = Path("/host/opt/codex-agent/.env")
+        if not env_path.exists():
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, ".env file tidak ditemukan")
+        existing = env_path.read_text(encoding="utf-8").splitlines()
+        out_lines = []
+        replaced = False
+        for ln in existing:
+            if ln.lstrip().startswith("API_PIN=") or ln.lstrip().startswith("API_PIN ="):
+                out_lines.append(f"API_PIN={new_pin}")
+                replaced = True
+            else:
+                out_lines.append(ln)
+        if not replaced:
+            out_lines.append(f"API_PIN={new_pin}")
+        env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        # Update in-memory settings so subsequent /api/auth/login uses the new PIN
+        # without requiring a container restart.
+        state.settings.api_pin = new_pin
+        get_settings.cache_clear()
+        logger.info("pin_changed")
+        return Response(status_code=204)
 
     # ------ chat WebSocket ------------------------------------------------
 
@@ -814,10 +940,20 @@ async def _run_user_turn(
     thr = await db.get_thread(session_id)
     if thr and thr["auto_named"] and (thr["name"].startswith("Untitled") or thr["name"] == "Untitled"):
         # Rename only on first user message
-        new_name = _slugify_for_thread(user_text or descriptions[0] if descriptions else "")
+        seed = user_text if user_text else (descriptions[0] if descriptions else "")
+        new_name = _slugify_for_thread(seed)
+        logger.info(
+            "autoname_check",
+            session_id=session_id,
+            current_name=thr["name"],
+            seed=seed[:50],
+            new_name=new_name,
+            will_rename=bool(new_name) and new_name != thr["name"],
+        )
         if new_name and new_name != thr["name"]:
             await db.rename_thread(session_id, new_name, mark_manual=False)
-            await bus.publish({"type": "session_renamed", "id": session_id, "name": new_name})
+            final_name = (await db.get_thread(session_id) or {}).get("name", new_name)
+            await bus.publish({"type": "session_renamed", "id": session_id, "name": final_name})
 
     # Build prompt context
     history = await db.get_thread_history(session_id, settings.history_max_messages)
