@@ -16,8 +16,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import structlog
 
@@ -26,6 +28,26 @@ from . import codex_auth
 logger = structlog.get_logger(__name__)
 
 ProgressCb = Callable[[str], Awaitable[None]]
+"""Legacy text-only progress callback. Receives the formatted one-liner
+(e.g. ``'✓ `ls -la`'``)."""
+
+EventCb = Callable[[dict[str, Any]], Awaitable[None]]
+"""Rich structured-event callback. Receives a dict shaped according to the
+``stream_schema_version=2`` schema documented in ``docs/event-schema.md``.
+Key fields:
+
+- ``type``: ``"tool_call"``, ``"plan"``, ``"reasoning"``
+- ``id``: stable ID for the item across started/completed (Codex item id
+  when present, else a generated UUID)
+- ``kind``: subtype within tool_call (``command_execution``, ``file_change``,
+  ``web_search``, ``mcp_tool_call``)
+- ``status``: ``"running"``, ``"ok"``, ``"failed"``
+- ``ts``: epoch seconds (float)
+- ``item``: the raw Codex CLI item for forward-compat
+- additional well-known fields per kind (``command``, ``stdout``, ``stderr``,
+  ``exit_code``, ``path``, ``change_kind``, ``query``, ``name``,
+  ``arguments``, ``steps``, ``text``).
+"""
 
 
 @dataclass
@@ -92,6 +114,7 @@ async def run_codex(
     user_text: str,
     images: list[str] | None = None,
     on_progress: ProgressCb | None = None,
+    on_event: EventCb | None = None,
     sandbox: str = "danger-full-access",
     workdir: str = "/workspace",
     extra_args: list[str] | None = None,
@@ -246,7 +269,7 @@ async def run_codex(
                 # Non-JSON line (rare with --json). Treat as final text fallback.
                 final_chunks.append(line)
                 continue
-            await _handle_event(evt, result, final_chunks, on_progress)
+            await _handle_event(evt, result, final_chunks, on_progress, on_event)
 
     consumer_task = asyncio.gather(consume_stdout(), consume_stderr())
 
@@ -296,6 +319,7 @@ async def run_codex_with_rotation(
     history: list[dict[str, str]],
     user_text: str,
     on_progress: ProgressCb | None = None,
+    on_event: EventCb | None = None,
     sandbox: str = "danger-full-access",
     workdir: str = "/workspace",
     extra_args: list[str] | None = None,
@@ -316,6 +340,7 @@ async def run_codex_with_rotation(
             user_text=user_text,
             images=images,
             on_progress=on_progress,
+            on_event=on_event,
             sandbox=sandbox,
             workdir=workdir,
             extra_args=extra_args,
@@ -362,6 +387,7 @@ async def _handle_event(
     result: CodexResult,
     final_chunks: list[str],
     on_progress: ProgressCb | None,
+    on_event: EventCb | None,
 ) -> None:
     etype = evt.get("type", "")
     if etype == "thread.started":
@@ -389,6 +415,14 @@ async def _handle_event(
             final_chunks.append(text)
         return
 
+    if on_event is not None:
+        rich = _to_rich_event(etype, itype, item)
+        if rich is not None:
+            try:
+                await on_event(rich)
+            except Exception:  # noqa: BLE001
+                pass
+
     if on_progress is None:
         return
 
@@ -398,6 +432,81 @@ async def _handle_event(
             await on_progress(label)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _to_rich_event(etype: str, itype: str, item: dict) -> dict | None:
+    """Convert a Codex CLI item event into the v2 rich event schema.
+
+    Returns None for item types we do not surface (e.g. agent_message,
+    which is handled via the final-text path).
+    """
+    started = etype == "item.started"
+    completed = etype == "item.completed"
+    if not (started or completed):
+        return None
+
+    item_id = str(item.get("id") or item.get("item_id") or uuid.uuid4())
+    base: dict[str, Any] = {
+        "id": item_id,
+        "ts": time.time(),
+        "item": item,
+    }
+
+    if itype in ("command_execution", "file_change", "web_search", "mcp_tool_call"):
+        base["type"] = "tool_call"
+        base["kind"] = itype
+        if started:
+            base["status"] = "running"
+        else:
+            raw_status = item.get("status")
+            ec = item.get("exit_code")
+            if raw_status == "failed" or (ec not in (None, 0)):
+                base["status"] = "failed"
+            else:
+                base["status"] = "ok"
+
+        if itype == "command_execution":
+            base["command"] = item.get("command") or ""
+            if completed:
+                base["exit_code"] = item.get("exit_code")
+                base["stdout"] = item.get("stdout")
+                base["stderr"] = item.get("stderr")
+                base["aggregated_output"] = item.get("aggregated_output")
+        elif itype == "file_change":
+            base["path"] = item.get("path")
+            base["change_kind"] = item.get("change_kind") or item.get("operation") or "edit"
+            if completed:
+                base["diff"] = item.get("diff") or item.get("unified_diff")
+                base["contents"] = item.get("contents") or item.get("new_contents")
+        elif itype == "web_search":
+            base["query"] = item.get("query") or ""
+            if completed:
+                base["results"] = item.get("results")
+        elif itype == "mcp_tool_call":
+            base["name"] = item.get("name") or item.get("tool") or "mcp"
+            base["arguments"] = item.get("arguments") or item.get("args")
+            if completed:
+                base["result"] = item.get("result") or item.get("output")
+        return base
+
+    if itype == "plan_update":
+        if not completed:
+            return None
+        base["type"] = "plan"
+        base["status"] = "ok"
+        base["steps"] = item.get("steps") or []
+        return base
+
+    if itype == "reasoning":
+        text = item.get("text") or item.get("message") or item.get("summary") or ""
+        if not text:
+            return None
+        base["type"] = "reasoning"
+        base["status"] = "ok" if completed else "running"
+        base["text"] = text
+        return base
+
+    return None
 
 
 def _format_progress_event(etype: str, itype: str, item: dict) -> str | None:
