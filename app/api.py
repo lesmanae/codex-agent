@@ -1,0 +1,728 @@
+"""FastAPI server for the Codex Agent backend.
+
+Exposes REST + WebSocket endpoints used by the Android (or any) client:
+
+  Auth
+    POST /api/auth/login                 — exchange PIN for bearer token
+    GET  /api/auth/me                    — verify token
+
+  Sessions (= threads)
+    GET    /api/sessions                  — list all threads
+    POST   /api/sessions                  — create new thread (auto-active)
+    PATCH  /api/sessions/{id}             — rename
+    DELETE /api/sessions/{id}             — delete
+    POST   /api/sessions/{id}/activate    — set as active
+    GET    /api/sessions/active           — fetch (or auto-create) active thread
+
+  Messages
+    GET  /api/sessions/{id}/messages       — list history
+    POST /api/sessions/{id}/messages/clear — wipe history
+    POST /api/sessions/{id}/uploads        — upload one or more files
+
+  Codex accounts
+    GET  /api/codex/accounts             — list with active/exhausted status
+    POST /api/codex/login/start          — begin OAuth, returns auth URL
+    POST /api/codex/login/complete       — submit callback URL to finalize
+    POST /api/codex/login/cancel         — abort pending login
+
+  Skills
+    GET  /api/skills                     — names + summaries
+
+  Health
+    GET  /api/health                     — service liveness probe
+    GET  /api/info                       — public discovery (current URL + version)
+
+  WebSocket
+    WS   /api/ws/chat/{session_id}?token=...
+         Send {"type":"user_message","text":"...","attachment_ids":[...]}
+         Receive a stream of:
+           {"type":"progress","text":"..."}
+           {"type":"transcript","name":"...","transcript":"..."}
+           {"type":"agent_message","text":"..."}
+           {"type":"turn_done","ok":true,"rate_limited":false}
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+from pathlib import Path
+from typing import Annotated, Any, AsyncIterator
+
+import structlog
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Header,
+    Query,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from . import attachments as att_mod
+from . import auth as auth_mod
+from . import codex_auth, transcribe
+from .codex_runner import run_codex_with_rotation
+from .config import Settings, get_settings
+from .db import BotDB
+from .jailbreak import build_system_instruction
+from .skills import Skill, load_skills
+
+logger = structlog.get_logger("api")
+
+# Track active uploads per session_id+upload_id so the WS handler can resolve
+# attachment_ids submitted with a user message back to file paths.
+_uploads_by_id: dict[str, att_mod.Attachment] = {}
+
+
+# ---------------------------------------------------------------------------
+# App state container — populated at startup.
+# ---------------------------------------------------------------------------
+
+
+class AppState:
+    settings: Settings
+    db: BotDB
+    skills: list[Skill]
+
+
+state = AppState()
+
+
+# ---------------------------------------------------------------------------
+# Request / response schemas
+# ---------------------------------------------------------------------------
+
+
+class LoginRequest(BaseModel):
+    pin: str = Field(..., min_length=1, max_length=128)
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: int
+
+
+class SessionOut(BaseModel):
+    id: int
+    name: str
+    created_at: int
+    updated_at: int
+    auto_named: bool
+    msg_count: int = 0
+    is_active: bool = False
+
+
+class SessionCreateRequest(BaseModel):
+    name: str | None = None
+
+
+class SessionRenameRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+
+
+class MessageOut(BaseModel):
+    role: str
+    content: str
+
+
+class UploadOut(BaseModel):
+    id: str
+    kind: str
+    name: str
+    mime: str | None
+    size: int
+    host_path: str
+    container_path: str
+    transcript: str | None = None
+
+
+class CodexAccountOut(BaseModel):
+    name: str
+    email: str | None
+    plan: str | None
+    active: bool
+    exhausted: bool
+    exhausted_until: float
+    last_used: float
+
+
+class CodexLoginStartOut(BaseModel):
+    auth_url: str
+
+
+class CodexLoginCompleteRequest(BaseModel):
+    callback_url: str
+
+
+class CodexLoginCompleteOut(BaseModel):
+    name: str
+    email: str | None
+    plan: str | None
+
+
+class SkillOut(BaseModel):
+    name: str
+    summary: str
+
+
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+
+
+async def require_token(
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    payload = auth_mod.verify_token(token, state.settings.api_jwt_secret)
+    if payload is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")
+    return payload
+
+
+def _user_id() -> int:
+    return state.settings.owner_user_id
+
+
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Bootstrap DB + skills + media + codex auth on the same event loop
+    uvicorn runs the app on."""
+    settings = get_settings()
+    state.settings = settings
+
+    db = BotDB(settings.db_path, settings.encryption_secret)
+    await db.connect()
+    state.db = db
+
+    skills = load_skills(settings.skills_dir)
+    state.skills = skills
+    logger.info("skills_loaded", count=len(skills), names=[s.name for s in skills])
+
+    att_mod.configure(settings.inbox_container, settings.inbox_host)
+    transcribe.configure(settings.whisper_model, settings.whisper_cache)
+    logger.info(
+        "media_configured",
+        inbox_container=str(settings.inbox_container),
+        inbox_host=str(settings.inbox_host),
+        whisper_model=settings.whisper_model,
+        whisper_cache=str(settings.whisper_cache),
+    )
+
+    try:
+        await codex_auth.initialize_active_from_disk()
+    except Exception:  # noqa: BLE001
+        logger.exception("codex_auth_init_failed")
+
+    logger.info(
+        "api_ready",
+        host=settings.api_host,
+        port=settings.api_port,
+        cors=settings.cors_origin_list(),
+        owner_user_id=settings.owner_user_id,
+    )
+
+    yield
+
+    await db.close()
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(title="codex-agent", version="0.4.0", lifespan=_lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origin_list(),
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    _register_routes(app)
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
+def _register_routes(app: FastAPI) -> None:
+    @app.get("/api/health")
+    async def health() -> dict:
+        return {"ok": True, "version": app.version}
+
+    @app.get("/api/info")
+    async def info() -> dict:
+        """Public discovery endpoint.
+
+        Returns the current public URL the API is reachable at, plus version.
+        The URL is read from a host-mounted file populated by the
+        cloudflared tunnel watcher (no auth required so that a fresh client
+        can bootstrap without ever talking to the API directly first).
+        """
+        public_url: str | None = None
+        try:
+            url_path = Path(state.settings.public_url_file)
+            if url_path.is_file():
+                public_url = url_path.read_text(encoding="utf-8").strip() or None
+        except Exception:  # noqa: BLE001
+            public_url = None
+        return {
+            "ok": True,
+            "version": app.version,
+            "public_url": public_url,
+        }
+
+    # ------ auth ----------------------------------------------------------
+
+    @app.post("/api/auth/login", response_model=LoginResponse)
+    async def login(req: LoginRequest) -> LoginResponse:
+        if not auth_mod.pin_matches(req.pin, state.settings.api_pin):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "wrong PIN")
+        token, exp = auth_mod.issue_token(
+            subject=str(state.settings.owner_user_id),
+            secret=state.settings.api_jwt_secret,
+            ttl_seconds=state.settings.api_token_ttl_seconds,
+        )
+        return LoginResponse(access_token=token, expires_at=exp)
+
+    @app.get("/api/auth/me")
+    async def me(payload: dict = Depends(require_token)) -> dict:
+        return {"sub": payload.get("sub"), "exp": payload.get("exp")}
+
+    # ------ sessions ------------------------------------------------------
+
+    @app.get("/api/sessions", response_model=list[SessionOut])
+    async def list_sessions(_: dict = Depends(require_token)) -> list[SessionOut]:
+        threads = await state.db.list_threads(_user_id())
+        active_id = await state.db.get_active_thread_id(_user_id())
+        return [
+            SessionOut(
+                id=t["id"],
+                name=t["name"],
+                created_at=t["created_at"],
+                updated_at=t["updated_at"],
+                auto_named=t["auto_named"],
+                msg_count=t.get("msg_count", 0),
+                is_active=t["id"] == active_id,
+            )
+            for t in threads
+        ]
+
+    @app.post("/api/sessions", response_model=SessionOut, status_code=201)
+    async def create_session(
+        req: SessionCreateRequest,
+        _: dict = Depends(require_token),
+    ) -> SessionOut:
+        name = (req.name or "").strip() or "Untitled"
+        auto = not req.name
+        tid = await state.db.create_thread(_user_id(), name, auto_named=auto)
+        await state.db.set_active_thread(_user_id(), tid)
+        t = await state.db.get_thread(tid)
+        assert t
+        return SessionOut(
+            id=t["id"], name=t["name"],
+            created_at=t["created_at"], updated_at=t["updated_at"],
+            auto_named=t["auto_named"], msg_count=0, is_active=True,
+        )
+
+    @app.get("/api/sessions/active", response_model=SessionOut)
+    async def get_active(_: dict = Depends(require_token)) -> SessionOut:
+        t = await state.db.ensure_active_thread(_user_id())
+        # Compute message count
+        threads = await state.db.list_threads(_user_id())
+        msg_count = next((x["msg_count"] for x in threads if x["id"] == t["id"]), 0)
+        return SessionOut(
+            id=t["id"], name=t["name"],
+            created_at=t["created_at"], updated_at=t["updated_at"],
+            auto_named=t["auto_named"], msg_count=msg_count, is_active=True,
+        )
+
+    @app.patch("/api/sessions/{session_id}", response_model=SessionOut)
+    async def rename_session(
+        session_id: int,
+        req: SessionRenameRequest,
+        _: dict = Depends(require_token),
+    ) -> SessionOut:
+        thr = await state.db.get_thread(session_id)
+        if not thr or thr["user_id"] != _user_id():
+            raise HTTPException(404, "session not found")
+        await state.db.rename_thread(session_id, req.name, mark_manual=True)
+        t = await state.db.get_thread(session_id)
+        assert t
+        active_id = await state.db.get_active_thread_id(_user_id())
+        return SessionOut(
+            id=t["id"], name=t["name"],
+            created_at=t["created_at"], updated_at=t["updated_at"],
+            auto_named=t["auto_named"], is_active=t["id"] == active_id,
+        )
+
+    @app.delete("/api/sessions/{session_id}", status_code=204)
+    async def delete_session(
+        session_id: int,
+        _: dict = Depends(require_token),
+    ) -> None:
+        thr = await state.db.get_thread(session_id)
+        if not thr or thr["user_id"] != _user_id():
+            raise HTTPException(404, "session not found")
+        await state.db.delete_thread(session_id)
+        return None
+
+    @app.post("/api/sessions/{session_id}/activate", response_model=SessionOut)
+    async def activate_session(
+        session_id: int,
+        _: dict = Depends(require_token),
+    ) -> SessionOut:
+        thr = await state.db.get_thread(session_id)
+        if not thr or thr["user_id"] != _user_id():
+            raise HTTPException(404, "session not found")
+        await state.db.set_active_thread(_user_id(), session_id)
+        return SessionOut(
+            id=thr["id"], name=thr["name"],
+            created_at=thr["created_at"], updated_at=thr["updated_at"],
+            auto_named=thr["auto_named"], is_active=True,
+        )
+
+    # ------ messages ------------------------------------------------------
+
+    @app.get(
+        "/api/sessions/{session_id}/messages",
+        response_model=list[MessageOut],
+    )
+    async def list_messages(
+        session_id: int,
+        limit: int = Query(default=200, ge=1, le=2000),
+        _: dict = Depends(require_token),
+    ) -> list[MessageOut]:
+        thr = await state.db.get_thread(session_id)
+        if not thr or thr["user_id"] != _user_id():
+            raise HTTPException(404, "session not found")
+        msgs = await state.db.get_thread_history(session_id, limit)
+        return [MessageOut(role=m["role"], content=m["content"]) for m in msgs]
+
+    @app.post("/api/sessions/{session_id}/messages/clear", status_code=204)
+    async def clear_messages(
+        session_id: int,
+        _: dict = Depends(require_token),
+    ) -> None:
+        thr = await state.db.get_thread(session_id)
+        if not thr or thr["user_id"] != _user_id():
+            raise HTTPException(404, "session not found")
+        await state.db.clear_thread_history(session_id)
+        return None
+
+    # ------ uploads -------------------------------------------------------
+
+    @app.post(
+        "/api/sessions/{session_id}/uploads",
+        response_model=list[UploadOut],
+    )
+    async def upload_files(
+        session_id: int,
+        files: list[UploadFile] = File(...),
+        kind_hint: str | None = Form(default=None),
+        transcribe_audio: bool = Form(default=True),
+        _: dict = Depends(require_token),
+    ) -> list[UploadOut]:
+        thr = await state.db.get_thread(session_id)
+        if not thr or thr["user_id"] != _user_id():
+            raise HTTPException(404, "session not found")
+
+        out: list[UploadOut] = []
+        for f in files:
+            data = await f.read()
+            att = att_mod.save_upload(
+                user_id=_user_id(),
+                thread_id=session_id,
+                original_name=f.filename or "file",
+                data=data,
+                mime=f.content_type,
+                kind_hint=kind_hint,
+            )
+            upload_id = f"{session_id}:{att.container_path.name}"
+            _uploads_by_id[upload_id] = att
+
+            # Eagerly transcribe voice/audio so the client can show the text
+            # before the next chat turn even starts.
+            transcript: str | None = None
+            if transcribe_audio and att.kind in {"voice", "audio"}:
+                try:
+                    transcript = await transcribe.transcribe(att.container_path)
+                except Exception:  # noqa: BLE001
+                    logger.exception("upload_transcribe_failed", path=str(att.container_path))
+
+            out.append(UploadOut(
+                id=upload_id,
+                kind=att.kind,
+                name=att.name,
+                mime=att.mime,
+                size=att.size,
+                host_path=str(att.host_path),
+                container_path=str(att.container_path),
+                transcript=transcript,
+            ))
+        return out
+
+    # ------ codex accounts -----------------------------------------------
+
+    @app.get("/api/codex/accounts", response_model=list[CodexAccountOut])
+    async def codex_accounts(_: dict = Depends(require_token)) -> list[CodexAccountOut]:
+        accs = await codex_auth.accounts_with_status()
+        return [CodexAccountOut(**a) for a in accs]
+
+    @app.post("/api/codex/login/start", response_model=CodexLoginStartOut)
+    async def codex_login_start(_: dict = Depends(require_token)) -> CodexLoginStartOut:
+        try:
+            pending = await codex_auth.start_login(user_id=_user_id())
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(500, f"codex login start failed: {exc}") from exc
+        return CodexLoginStartOut(auth_url=pending.url)
+
+    @app.post(
+        "/api/codex/login/complete",
+        response_model=CodexLoginCompleteOut,
+    )
+    async def codex_login_complete(
+        req: CodexLoginCompleteRequest,
+        _: dict = Depends(require_token),
+    ) -> CodexLoginCompleteOut:
+        try:
+            info, name = await codex_auth.complete_login(req.callback_url)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, f"codex login complete failed: {exc}") from exc
+        return CodexLoginCompleteOut(name=name, email=info.email, plan=info.plan)
+
+    @app.post("/api/codex/login/cancel", status_code=204)
+    async def codex_login_cancel(_: dict = Depends(require_token)) -> None:
+        await codex_auth.cancel_login()
+        return None
+
+    # ------ skills --------------------------------------------------------
+
+    @app.get("/api/skills", response_model=list[SkillOut])
+    async def list_skills(_: dict = Depends(require_token)) -> list[SkillOut]:
+        return [SkillOut(name=s.name, summary=s.summary) for s in state.skills]
+
+    # ------ chat WebSocket ------------------------------------------------
+
+    @app.websocket("/api/ws/chat/{session_id}")
+    async def chat_ws(
+        ws: WebSocket,
+        session_id: int,
+        token: str = Query(...),
+    ) -> None:
+        # Verify token before accepting (raises before handshake completes).
+        payload = auth_mod.verify_token(token, state.settings.api_jwt_secret)
+        if payload is None:
+            await ws.close(code=4401)
+            return
+
+        thr = await state.db.get_thread(session_id)
+        if not thr or thr["user_id"] != _user_id():
+            await ws.close(code=4404)
+            return
+
+        await ws.accept()
+        await state.db.set_active_thread(_user_id(), session_id)
+
+        try:
+            while True:
+                raw = await ws.receive_text()
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    await _ws_send(ws, {"type": "error", "text": "invalid JSON"})
+                    continue
+
+                mtype = msg.get("type")
+                if mtype != "user_message":
+                    await _ws_send(ws, {"type": "error", "text": f"unknown message type {mtype!r}"})
+                    continue
+
+                user_text = (msg.get("text") or "").strip()
+                attachment_ids = list(msg.get("attachment_ids") or [])
+                await _handle_user_turn(
+                    ws=ws,
+                    session_id=session_id,
+                    user_text=user_text,
+                    attachment_ids=attachment_ids,
+                )
+        except WebSocketDisconnect:
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("ws_unhandled")
+            try:
+                await _ws_send(ws, {"type": "error", "text": "internal error"})
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Chat-turn engine (used by the WebSocket handler)
+# ---------------------------------------------------------------------------
+
+
+async def _ws_send(ws: WebSocket, payload: dict) -> None:
+    try:
+        await ws.send_text(json.dumps(payload, ensure_ascii=False))
+    except Exception:  # noqa: BLE001
+        # client probably gone; let the outer loop deal with it.
+        raise
+
+
+async def _handle_user_turn(
+    *,
+    ws: WebSocket,
+    session_id: int,
+    user_text: str,
+    attachment_ids: list[str],
+) -> None:
+    """Run one chat turn end-to-end with progress streaming back to the client."""
+    settings = state.settings
+    db = state.db
+
+    # Resolve attachment_ids to actual files
+    images: list[str] = []
+    descriptions: list[str] = []
+    transcripts: list[str] = []
+    resolved: list[att_mod.Attachment] = []
+    for aid in attachment_ids:
+        att = _uploads_by_id.get(aid)
+        if not att:
+            await _ws_send(ws, {"type": "warning", "text": f"unknown attachment_id {aid}"})
+            continue
+        resolved.append(att)
+        descriptions.append(att_mod.describe(att))
+        if att.kind == "photo":
+            images.append(str(att.host_path))
+
+    # Transcribe any voice/audio that didn't already have a transcript on upload
+    for att in resolved:
+        if att.kind not in {"voice", "audio"}:
+            continue
+        await _ws_send(ws, {
+            "type": "progress",
+            "text": f"🎤 Transcribing {att.name}…",
+        })
+        try:
+            tx = await transcribe.transcribe(att.container_path)
+        except Exception:  # noqa: BLE001
+            logger.exception("transcribe_failed_in_turn", path=str(att.container_path))
+            tx = ""
+        if tx:
+            transcripts.append(f"[{att.name}] {tx}")
+            await _ws_send(ws, {
+                "type": "transcript",
+                "name": att.name,
+                "transcript": tx,
+            })
+
+    # Build augmented prompt
+    prompt_parts: list[str] = []
+    if user_text:
+        prompt_parts.append(user_text)
+    if descriptions:
+        prompt_parts.append("\nAttachments (already saved on the host):\n" + "\n".join(descriptions))
+    if transcripts:
+        prompt_parts.append("\nAudio transcripts:\n" + "\n\n".join(transcripts))
+    final_user_text = "\n\n".join([p for p in prompt_parts if p]).strip()
+
+    if not final_user_text:
+        await _ws_send(ws, {"type": "error", "text": "empty message"})
+        return
+
+    # Persist user message + maybe auto-rename thread
+    await db.append_message(
+        chat_id=session_id, user_id=settings.owner_user_id,
+        role="user", content=final_user_text, thread_id=session_id,
+    )
+    thr = await db.get_thread(session_id)
+    if thr and thr["auto_named"] and (thr["name"].startswith("Untitled") or thr["name"] == "Untitled"):
+        # Rename only on first user message
+        new_name = _slugify_for_thread(user_text or descriptions[0] if descriptions else "")
+        if new_name and new_name != thr["name"]:
+            await db.rename_thread(session_id, new_name, mark_manual=False)
+            await _ws_send(ws, {"type": "session_renamed", "id": session_id, "name": new_name})
+
+    # Build prompt context
+    history = await db.get_thread_history(session_id, settings.history_max_messages)
+    # Drop the just-appended message — codex_runner adds it back via user_text
+    if history and history[-1]["role"] == "user":
+        history = history[:-1]
+    system_instruction = build_system_instruction(state.skills)
+
+    # Forward codex progress back to client
+    async def _on_progress(text: str) -> None:
+        try:
+            await _ws_send(ws, {"type": "progress", "text": text})
+        except Exception:  # noqa: BLE001
+            pass
+
+    await _ws_send(ws, {"type": "turn_started"})
+    try:
+        result = await run_codex_with_rotation(
+            system_instruction=system_instruction,
+            history=history,
+            user_text=final_user_text,
+            images=images or None,
+            on_progress=_on_progress,
+            sandbox=settings.codex_sandbox,
+            workdir=str(settings.codex_workdir),
+            timeout_seconds=settings.codex_timeout_seconds,
+            codex_home=settings.codex_home,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("codex_turn_failed")
+        await _ws_send(ws, {
+            "type": "turn_done",
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "rate_limited": False,
+        })
+        return
+
+    if result.text:
+        await db.append_message(
+            chat_id=session_id, user_id=settings.owner_user_id,
+            role="assistant", content=result.text, thread_id=session_id,
+        )
+    await _ws_send(ws, {
+        "type": "agent_message",
+        "text": result.text,
+    })
+    await _ws_send(ws, {
+        "type": "turn_done",
+        "ok": result.error is None,
+        "error": result.error,
+        "rate_limited": result.rate_limited,
+        "usage": result.usage,
+    })
+
+
+def _slugify_for_thread(text: str, max_len: int = 40) -> str:
+    """Mirror of db._slugify_for_thread (kept here to avoid the import cycle)."""
+    import re as _re
+    text = (text or "").strip().splitlines()[0] if text else ""
+    text = _re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    if len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text

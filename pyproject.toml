@@ -1,0 +1,18 @@
+[project]
+name = "codex-agent"
+version = "0.4.0"
+description = "Codex-CLI-powered HTTP/WebSocket agent backend (Android client, multi-account ChatGPT Plus auth, multi-modal input, threads, voice transcription)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-multipart>=0.0.9",
+    "websockets>=13.0",
+    "aiosqlite>=0.20.0",
+    "cryptography>=43.0.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.5.0",
+    "structlog>=24.4.0",
+    "httpx>=0.27.2",
+    "faster-whisper>=1.0.3",
+]

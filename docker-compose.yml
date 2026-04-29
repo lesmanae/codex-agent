@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    image: codex-agent:latest
+    container_name: codex-agent
+    restart: unless-stopped
+    privileged: true        # nsenter needs CAP_SYS_ADMIN to enter host namespaces
+    pid: host               # share PID namespace so PID 1 = host's init
+    network_mode: host      # use host network so the API binds host:API_PORT directly
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - /:/host             # host filesystem available at /host (read-write)
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
