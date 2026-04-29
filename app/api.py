@@ -20,10 +20,12 @@ Exposes REST + WebSocket endpoints used by the Android (or any) client:
     POST /api/sessions/{id}/uploads        — upload one or more files
 
   Codex accounts
-    GET  /api/codex/accounts             — list with active/exhausted status
-    POST /api/codex/login/start          — begin OAuth, returns auth URL
-    POST /api/codex/login/complete       — submit callback URL to finalize
-    POST /api/codex/login/cancel         — abort pending login
+    GET    /api/codex/accounts                    — list with active/exhausted status
+    POST   /api/codex/accounts/{name}/activate    — swap auth.json to this account
+    DELETE /api/codex/accounts/{name}             — remove backup + scrub state
+    POST   /api/codex/login/start                 — begin OAuth, returns auth URL
+    POST   /api/codex/login/complete              — submit callback URL to finalize
+    POST   /api/codex/login/cancel                — abort pending login
 
   Skills
     GET  /api/skills                     — names + summaries
@@ -74,6 +76,7 @@ from .config import Settings, get_settings
 from .db import BotDB
 from .jailbreak import build_system_instruction
 from .skills import Skill, load_skills
+from .turn_bus import SessionBus, registry as turn_registry
 
 logger = structlog.get_logger("api")
 
@@ -167,6 +170,17 @@ class CodexLoginCompleteOut(BaseModel):
     name: str
     email: str | None
     plan: str | None
+
+
+class CodexAccountActivateOut(BaseModel):
+    name: str
+    email: str | None
+    plan: str | None
+
+
+class TurnStateOut(BaseModel):
+    busy: bool
+    events: list[dict] = Field(default_factory=list)
 
 
 class SkillOut(BaseModel):
@@ -427,6 +441,25 @@ def _register_routes(app: FastAPI) -> None:
         await state.db.clear_thread_history(session_id)
         return None
 
+    @app.get(
+        "/api/sessions/{session_id}/turn_state",
+        response_model=TurnStateOut,
+    )
+    async def turn_state(
+        session_id: int,
+        _: dict = Depends(require_token),
+    ) -> TurnStateOut:
+        """Whether a codex turn is currently in flight + replay buffer.
+
+        Clients use this on (re)entry to a chat to decide if they should
+        immediately re-render an in-progress spinner + the partial output
+        we've already streamed."""
+        thr = await state.db.get_thread(session_id)
+        if not thr or thr["user_id"] != _user_id():
+            raise HTTPException(404, "session not found")
+        bus = await turn_registry.get(session_id)
+        return TurnStateOut(busy=bus.busy(), events=list(bus.events))
+
     # ------ uploads -------------------------------------------------------
 
     @app.post(
@@ -513,6 +546,37 @@ def _register_routes(app: FastAPI) -> None:
         await codex_auth.cancel_login()
         return None
 
+    @app.post(
+        "/api/codex/accounts/{name}/activate",
+        response_model=CodexAccountActivateOut,
+    )
+    async def codex_account_activate(
+        name: str,
+        _: dict = Depends(require_token),
+    ) -> CodexAccountActivateOut:
+        try:
+            info = await codex_auth.set_active_account(name)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(500, f"activate failed: {exc}") from exc
+        return CodexAccountActivateOut(name=name, email=info.email, plan=info.plan)
+
+    @app.delete("/api/codex/accounts/{name}", status_code=204)
+    async def codex_account_delete(
+        name: str,
+        _: dict = Depends(require_token),
+    ) -> None:
+        try:
+            existed = await codex_auth.delete_account(name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if not existed:
+            raise HTTPException(404, f"no saved account named {name!r}")
+        return None
+
     # ------ skills --------------------------------------------------------
 
     @app.get("/api/skills", response_model=list[SkillOut])
@@ -541,7 +605,22 @@ def _register_routes(app: FastAPI) -> None:
         await ws.accept()
         await state.db.set_active_thread(_user_id(), session_id)
 
+        bus = await turn_registry.get(session_id)
+        queue = bus.subscribe()
+
+        # Replay everything we've already published this turn so the client
+        # can rebuild the partial UI on reconnect (back button, network blip).
         try:
+            for ev in list(bus.events):
+                await _ws_send(ws, ev)
+            if bus.busy():
+                await _ws_send(ws, {"type": "turn_resumed"})
+        except Exception:  # noqa: BLE001
+            bus.unsubscribe(queue)
+            return
+
+        async def _pump_in() -> None:
+            """Read user_message frames and dispatch them to the bus."""
             while True:
                 raw = await ws.receive_text()
                 try:
@@ -551,27 +630,56 @@ def _register_routes(app: FastAPI) -> None:
                     continue
 
                 mtype = msg.get("type")
+                if mtype == "ping":
+                    await _ws_send(ws, {"type": "pong"})
+                    continue
                 if mtype != "user_message":
                     await _ws_send(ws, {"type": "error", "text": f"unknown message type {mtype!r}"})
                     continue
 
+                if bus.busy():
+                    await _ws_send(ws, {
+                        "type": "error",
+                        "text": "another turn is still in progress; wait for turn_done.",
+                    })
+                    continue
+
                 user_text = (msg.get("text") or "").strip()
                 attachment_ids = list(msg.get("attachment_ids") or [])
-                await _handle_user_turn(
-                    ws=ws,
+                await _start_user_turn(
                     session_id=session_id,
                     user_text=user_text,
                     attachment_ids=attachment_ids,
                 )
+
+        async def _pump_out() -> None:
+            """Drain the bus subscription and forward to the live socket."""
+            while True:
+                ev = await queue.get()
+                await _ws_send(ws, ev)
+
+        in_task = asyncio.create_task(_pump_in(), name=f"ws-in-{session_id}")
+        out_task = asyncio.create_task(_pump_out(), name=f"ws-out-{session_id}")
+        try:
+            done, pending = await asyncio.wait(
+                {in_task, out_task},
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+            for t in pending:
+                t.cancel()
+            for t in done:
+                exc = t.exception()
+                if exc and not isinstance(exc, WebSocketDisconnect):
+                    logger.exception("ws_pump_failed", exc_info=exc)
         except WebSocketDisconnect:
-            return
+            pass
         except Exception:  # noqa: BLE001
             logger.exception("ws_unhandled")
-            try:
-                await _ws_send(ws, {"type": "error", "text": "internal error"})
-                await ws.close()
-            except Exception:  # noqa: BLE001
-                pass
+        finally:
+            bus.unsubscribe(queue)
+            for t in (in_task, out_task):
+                if not t.done():
+                    t.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -587,14 +695,44 @@ async def _ws_send(ws: WebSocket, payload: dict) -> None:
         raise
 
 
-async def _handle_user_turn(
+async def _start_user_turn(
     *,
-    ws: WebSocket,
     session_id: int,
     user_text: str,
     attachment_ids: list[str],
 ) -> None:
-    """Run one chat turn end-to-end with progress streaming back to the client."""
+    """Schedule a detached codex turn on the session's bus.
+
+    The codex run is owned by the bus (not the WS), so client disconnects
+    don't cancel it. Events are persisted to the bus's replay buffer +
+    fanned out to all live subscribers."""
+
+    async def _coro(bus: SessionBus) -> None:
+        await _run_user_turn(
+            bus=bus,
+            session_id=session_id,
+            user_text=user_text,
+            attachment_ids=attachment_ids,
+        )
+
+    bus, started = await turn_registry.start_turn(session_id, _coro)
+    if not started:
+        # Another turn already running — should have been caught by the
+        # caller, but stay defensive.
+        await bus.publish({
+            "type": "error",
+            "text": "another turn is still in progress; wait for turn_done.",
+        })
+
+
+async def _run_user_turn(
+    *,
+    bus: SessionBus,
+    session_id: int,
+    user_text: str,
+    attachment_ids: list[str],
+) -> None:
+    """Detached codex turn body — emits everything via the bus."""
     settings = state.settings
     db = state.db
 
@@ -606,7 +744,7 @@ async def _handle_user_turn(
     for aid in attachment_ids:
         att = _uploads_by_id.get(aid)
         if not att:
-            await _ws_send(ws, {"type": "warning", "text": f"unknown attachment_id {aid}"})
+            await bus.publish({"type": "warning", "text": f"unknown attachment_id {aid}"})
             continue
         resolved.append(att)
         descriptions.append(att_mod.describe(att))
@@ -617,7 +755,7 @@ async def _handle_user_turn(
     for att in resolved:
         if att.kind not in {"voice", "audio"}:
             continue
-        await _ws_send(ws, {
+        await bus.publish({
             "type": "progress",
             "text": f"🎤 Transcribing {att.name}…",
         })
@@ -628,7 +766,7 @@ async def _handle_user_turn(
             tx = ""
         if tx:
             transcripts.append(f"[{att.name}] {tx}")
-            await _ws_send(ws, {
+            await bus.publish({
                 "type": "transcript",
                 "name": att.name,
                 "transcript": tx,
@@ -645,21 +783,26 @@ async def _handle_user_turn(
     final_user_text = "\n\n".join([p for p in prompt_parts if p]).strip()
 
     if not final_user_text:
-        await _ws_send(ws, {"type": "error", "text": "empty message"})
+        await bus.publish({"type": "error", "text": "empty message"})
+        await bus.publish({"type": "turn_done", "ok": False, "error": "empty message", "rate_limited": False})
         return
 
-    # Persist user message + maybe auto-rename thread
+    # Persist user message + maybe auto-rename thread.
     await db.append_message(
         chat_id=session_id, user_id=settings.owner_user_id,
         role="user", content=final_user_text, thread_id=session_id,
     )
+    await bus.publish({
+        "type": "user_message_persisted",
+        "content": final_user_text,
+    })
     thr = await db.get_thread(session_id)
     if thr and thr["auto_named"] and (thr["name"].startswith("Untitled") or thr["name"] == "Untitled"):
         # Rename only on first user message
         new_name = _slugify_for_thread(user_text or descriptions[0] if descriptions else "")
         if new_name and new_name != thr["name"]:
             await db.rename_thread(session_id, new_name, mark_manual=False)
-            await _ws_send(ws, {"type": "session_renamed", "id": session_id, "name": new_name})
+            await bus.publish({"type": "session_renamed", "id": session_id, "name": new_name})
 
     # Build prompt context
     history = await db.get_thread_history(session_id, settings.history_max_messages)
@@ -668,14 +811,10 @@ async def _handle_user_turn(
         history = history[:-1]
     system_instruction = build_system_instruction(state.skills)
 
-    # Forward codex progress back to client
     async def _on_progress(text: str) -> None:
-        try:
-            await _ws_send(ws, {"type": "progress", "text": text})
-        except Exception:  # noqa: BLE001
-            pass
+        await bus.publish({"type": "progress", "text": text})
 
-    await _ws_send(ws, {"type": "turn_started"})
+    await bus.publish({"type": "turn_started"})
     try:
         result = await run_codex_with_rotation(
             system_instruction=system_instruction,
@@ -688,9 +827,17 @@ async def _handle_user_turn(
             timeout_seconds=settings.codex_timeout_seconds,
             codex_home=settings.codex_home,
         )
+    except asyncio.CancelledError:
+        await bus.publish({
+            "type": "turn_done",
+            "ok": False,
+            "error": "turn cancelled",
+            "rate_limited": False,
+        })
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.exception("codex_turn_failed")
-        await _ws_send(ws, {
+        await bus.publish({
             "type": "turn_done",
             "ok": False,
             "error": f"{type(exc).__name__}: {exc}",
@@ -703,11 +850,11 @@ async def _handle_user_turn(
             chat_id=session_id, user_id=settings.owner_user_id,
             role="assistant", content=result.text, thread_id=session_id,
         )
-    await _ws_send(ws, {
+    await bus.publish({
         "type": "agent_message",
         "text": result.text,
     })
-    await _ws_send(ws, {
+    await bus.publish({
         "type": "turn_done",
         "ok": result.error is None,
         "error": result.error,
