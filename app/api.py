@@ -38,10 +38,24 @@ Exposes REST + WebSocket endpoints used by the Android (or any) client:
     WS   /api/ws/chat/{session_id}?token=...
          Send {"type":"user_message","text":"...","attachment_ids":[...]}
          Receive a stream of:
+           # Legacy v1 events (always emitted, kept stable for old clients):
            {"type":"progress","text":"..."}
            {"type":"transcript","name":"...","transcript":"..."}
            {"type":"agent_message","text":"..."}
            {"type":"turn_done","ok":true,"rate_limited":false}
+           # v2 rich events (server announces support via
+           # /api/info -> stream_schema_version: 2):
+           {"type":"tool_call","kind":"command_execution","id":"...",
+            "status":"running|ok|failed","command":"...","stdout":...,
+            "stderr":...,"exit_code":0,"ts":1234567890.0,"item":{...}}
+           {"type":"tool_call","kind":"file_change","id":"...",
+            "status":"ok","path":"...","change_kind":"edit","diff":...}
+           {"type":"tool_call","kind":"web_search","id":"...",
+            "status":"ok","query":"...","results":[...]}
+           {"type":"tool_call","kind":"mcp_tool_call","id":"...",
+            "status":"ok","name":"...","arguments":{...},"result":...}
+           {"type":"plan","id":"...","status":"ok","steps":[...]}
+           {"type":"reasoning","id":"...","status":"ok","text":"..."}
 """
 from __future__ import annotations
 
@@ -301,6 +315,7 @@ def _register_routes(app: FastAPI) -> None:
             "ok": True,
             "version": app.version,
             "public_url": public_url,
+            "stream_schema_version": 2,
         }
 
     # ------ auth ----------------------------------------------------------
@@ -814,6 +829,10 @@ async def _run_user_turn(
     async def _on_progress(text: str) -> None:
         await bus.publish({"type": "progress", "text": text})
 
+    async def _on_event(ev: dict) -> None:
+        # Forward the rich v2 event for clients that understand the schema.
+        await bus.publish(ev)
+
     await bus.publish({"type": "turn_started"})
     try:
         result = await run_codex_with_rotation(
@@ -822,6 +841,7 @@ async def _run_user_turn(
             user_text=final_user_text,
             images=images or None,
             on_progress=_on_progress,
+            on_event=_on_event,
             sandbox=settings.codex_sandbox,
             workdir=str(settings.codex_workdir),
             timeout_seconds=settings.codex_timeout_seconds,
