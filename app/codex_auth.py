@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import json
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -67,6 +69,39 @@ def _nsenter(*cmd: str) -> list[str]:
     ]
 
 
+async def _run_sync_in_thread(
+    *cmd: str, timeout: int = 10
+) -> tuple[int, str, str]:
+    """Fire-and-forget capable runner backed by sync subprocess.
+
+    Used for cases (like spawning a detached `codex login` process) where
+    asyncio's pipe-based subprocess transport can hang under uvloop because
+    the orphaned child keeps the inherited pipe alive.
+    """
+
+    def _do() -> tuple[int, str, str]:
+        try:
+            res = subprocess.run(
+                list(cmd),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+                start_new_session=True,
+            )
+            return (
+                res.returncode,
+                res.stdout.decode("utf-8", "replace"),
+                res.stderr.decode("utf-8", "replace"),
+            )
+        except subprocess.TimeoutExpired:
+            return -1, "", f"timed out after {timeout}s"
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _do)
+
+
 async def _run(*cmd: str, input_bytes: bytes | None = None, timeout: int = 30) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -79,9 +114,20 @@ async def _run(*cmd: str, input_bytes: bytes | None = None, timeout: int = 30) -
             proc.communicate(input=input_bytes), timeout=timeout
         )
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except ProcessLookupError:
+            pass
         return -1, "", f"timed out after {timeout}s"
+    except ProcessLookupError:
+        # Race when the child detaches/exits very fast (e.g. nohup ... &
+        # disown). asyncio's transport cleanup tries to waitpid on an
+        # already-reaped pid and raises. Treat as a successful exit.
+        return proc.returncode or 0, "", ""
     return proc.returncode or 0, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
@@ -308,11 +354,14 @@ async def start_login(*, user_id: int) -> PendingLogin:
             initial_mtime = await auth_mtime()
             await _run(*_nsenter("bash", "-lc", f": > {LOGIN_LOG}"), timeout=5)
 
+            # Use sync subprocess via thread executor — uvloop's async
+            # subprocess transport hangs on detached children because the
+            # orphaned `codex login` keeps the parent's pipe alive.
             spawn_cmd = _nsenter(
                 "bash", "-lc",
-                f"nohup codex login > {LOGIN_LOG} 2>&1 & disown; echo OK",
+                f"( nohup codex login > {LOGIN_LOG} 2>&1 < /dev/null & ); echo OK",
             )
-            rc, out, err = await _run(*spawn_cmd, timeout=15)
+            rc, out, err = await _run_sync_in_thread(*spawn_cmd, timeout=10)
             logger.info(
                 "codex_login_spawn",
                 rc=rc,
@@ -339,8 +388,7 @@ async def start_login(*, user_id: int) -> PendingLogin:
                 await asyncio.sleep(0.5)
 
             if not url:
-                preview = last_log.strip().replace("
-", " | ")[:300] or "<empty>"
+                preview = last_log.strip().replace("\n", " | ")[:300] or "<empty>"
                 raise RuntimeError(
                     f"codex login started but no auth URL appeared in log within 20s. "
                     f"log preview: {preview}"
