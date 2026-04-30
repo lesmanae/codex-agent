@@ -969,6 +969,14 @@ async def _run_user_turn(
         # Forward the rich v2 event for clients that understand the schema.
         await bus.publish(ev)
 
+    # Forward model + reasoning_effort to the Codex CLI so we always run on
+    # the configured model (default: gpt-5.5) with reasoning summaries enabled.
+    extra_codex_args: list[str] = [
+        "-m", settings.codex_model,
+        "-c", f"model_reasoning_effort={settings.codex_reasoning_effort}",
+        "-c", "model_reasoning_summary=detailed",
+    ]
+
     await bus.publish({"type": "turn_started"})
     try:
         result = await run_codex_with_rotation(
@@ -980,6 +988,7 @@ async def _run_user_turn(
             on_event=_on_event,
             sandbox=settings.codex_sandbox,
             workdir=str(settings.codex_workdir),
+            extra_args=extra_codex_args,
             timeout_seconds=settings.codex_timeout_seconds,
             codex_home=settings.codex_home,
         )

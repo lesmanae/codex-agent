@@ -58,6 +58,13 @@ class Settings(BaseSettings):
 
     codex_timeout_seconds: int = 600
 
+    codex_model: str = "gpt-5.5"
+    """Codex CLI model to request via `-m`. Must match a slug in
+    `~/.codex/models_cache.json`."""
+
+    codex_reasoning_effort: str = "high"
+    """Reasoning effort level: low | medium | high | xhigh."""
+
     # ---- Multi-modal attachment inbox --------------------------------------
     # The API container writes uploads via `inbox_container`, but
     # codex (running on the host via nsenter) sees them at `inbox_host`.
