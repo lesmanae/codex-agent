@@ -111,8 +111,39 @@ class AppState:
     db: BotDB
     skills: list[Skill]
 
+    # Per-day usage rollup. Keys: "YYYY-MM-DD". Values: dict with
+    # input_tokens / output_tokens / reasoning_tokens / total_turns.
+    usage_by_day: dict[str, dict] = {}
+
 
 state = AppState()
+
+
+def _record_usage(usage: dict | None) -> None:
+    """Aggregate a single turn's Codex usage into ``state.usage_by_day``.
+
+    Codex CLI reports usage as keys like ``input_tokens``,
+    ``cached_input_tokens``, ``output_tokens``, ``reasoning_output_tokens``,
+    ``total_tokens``. We only sum the ones we display on mobile."""
+    if not isinstance(usage, dict):
+        return
+    import datetime as _dt
+    day = _dt.date.today().isoformat()
+    bucket = state.usage_by_day.setdefault(
+        day,
+        {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "total_turns": 0},
+    )
+    def _g(k: str) -> int:
+        v = usage.get(k)
+        return int(v) if isinstance(v, (int, float)) else 0
+    bucket["input_tokens"] += _g("input_tokens")
+    bucket["output_tokens"] += _g("output_tokens")
+    bucket["reasoning_tokens"] += _g("reasoning_output_tokens")
+    bucket["total_turns"] += 1
+    # Trim — keep last 14 days.
+    if len(state.usage_by_day) > 14:
+        for k in sorted(state.usage_by_day.keys())[:-14]:
+            state.usage_by_day.pop(k, None)
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +346,24 @@ def _register_routes(app: FastAPI) -> None:
     @app.get("/api/health")
     async def health() -> dict:
         return {"ok": True, "version": app.version}
+
+    @app.get("/api/usage")
+    async def get_usage(_: dict = Depends(require_token)) -> dict:
+        """Return the per-day token usage snapshot. Mobile uses this to render
+        a cost meter and warn before hitting the ChatGPT Plus rate limit."""
+        import datetime as _dt
+        days = sorted(state.usage_by_day.keys())
+        today = _dt.date.today().isoformat()
+        return {
+            "ok": True,
+            "today": state.usage_by_day.get(today, {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "total_turns": 0,
+            }),
+            "days": [{"date": d, **state.usage_by_day[d]} for d in days],
+        }
 
     @app.get("/api/info")
     async def info() -> dict:
@@ -975,6 +1024,12 @@ async def _run_user_turn(
     async def _on_event(ev: dict) -> None:
         # Forward the rich v2 event for clients that understand the schema.
         await bus.publish(ev)
+        # Derive a human-readable status label from the event so mobile can
+        # render a persistent "Codex sedang …" header without parsing rich
+        # events itself.
+        label = _status_label_for_event(ev)
+        if label:
+            await bus.publish({"type": "task_status", "status": "working", "label": label})
 
     # Forward model + reasoning_effort to the Codex CLI so we always run on
     # the configured model (default: gpt-5.5) with reasoning summaries enabled.
@@ -985,6 +1040,7 @@ async def _run_user_turn(
     ]
 
     await bus.publish({"type": "turn_started"})
+    await bus.publish({"type": "task_status", "status": "working", "label": "Codex sedang berpikir…"})
     try:
         result = await run_codex_with_rotation(
             system_instruction=system_instruction,
@@ -1000,6 +1056,7 @@ async def _run_user_turn(
             codex_home=settings.codex_home,
         )
     except asyncio.CancelledError:
+        await bus.publish({"type": "task_status", "status": "idle", "label": None})
         await bus.publish({
             "type": "turn_done",
             "ok": False,
@@ -1009,6 +1066,7 @@ async def _run_user_turn(
         raise
     except Exception as exc:  # noqa: BLE001
         logger.exception("codex_turn_failed")
+        await bus.publish({"type": "task_status", "status": "idle", "label": None})
         await bus.publish({
             "type": "turn_done",
             "ok": False,
@@ -1026,6 +1084,8 @@ async def _run_user_turn(
         "type": "agent_message",
         "text": result.text,
     })
+    _record_usage(result.usage)
+    await bus.publish({"type": "task_status", "status": "idle", "label": None})
     await bus.publish({
         "type": "turn_done",
         "ok": result.error is None,
@@ -1033,6 +1093,57 @@ async def _run_user_turn(
         "rate_limited": result.rate_limited,
         "usage": result.usage,
     })
+
+
+def _status_label_for_event(ev: dict) -> str | None:
+    """Map a v2 rich event to a short status string suitable for the mobile
+    header. Returns ``None`` when the event shouldn't update the status."""
+    t = ev.get("type")
+    if t == "reasoning":
+        return "Berpikir…" if ev.get("status") == "running" else None
+    if t == "tool_call":
+        kind = ev.get("kind")
+        status = ev.get("status")
+        if kind == "command_execution":
+            cmd = (ev.get("command") or "").strip().splitlines()[0:1]
+            head = cmd[0][:48] + ("…" if cmd and len(cmd[0]) > 48 else "") if cmd else ""
+            if status == "running":
+                return f"Menjalankan: {head}" if head else "Menjalankan shell…"
+            if status == "ok":
+                return None
+            if status == "failed":
+                return f"Shell gagal: {head}" if head else "Shell gagal"
+        if kind == "file_change":
+            path = ev.get("path") or ""
+            short = path.split("/")[-1] if path else ""
+            change = ev.get("change_kind") or "edit"
+            if status == "running":
+                return f"Mengedit {short}…" if short else "Mengedit file…"
+            if status == "ok":
+                return None
+            if status == "failed":
+                return f"Edit {short} gagal" if short else "Edit gagal"
+            return f"{change} {short}"
+        if kind == "web_search":
+            q = ev.get("query") or ""
+            if status == "running":
+                return f"Mencari: {q[:48]}…" if q else "Mencari di web…"
+            return None
+        if kind == "mcp_tool_call":
+            n = ev.get("name") or "tool"
+            if status == "running":
+                return f"MCP {n}…"
+            return None
+    if t == "plan":
+        steps = ev.get("steps") or []
+        if isinstance(steps, list) and steps:
+            inprog = next((s for s in steps if isinstance(s, dict) and s.get("status") == "in_progress"), None)
+            if inprog and isinstance(inprog, dict):
+                title = inprog.get("title") or ""
+                if title:
+                    return f"Step: {title[:60]}"
+        return "Update plan…"
+    return None
 
 
 def _slugify_for_thread(text: str, max_len: int = 40) -> str:
