@@ -774,6 +774,13 @@ def _register_routes(app: FastAPI) -> None:
                 if mtype == "ping":
                     await _ws_send(ws, {"type": "pong"})
                     continue
+                if mtype == "interrupt":
+                    if bus.task is not None and not bus.task.done():
+                        bus.task.cancel()
+                        await _ws_send(ws, {"type": "info", "text": "turn dibatalkan"})
+                    else:
+                        await _ws_send(ws, {"type": "info", "text": "tidak ada turn yang berjalan"})
+                    continue
                 if mtype != "user_message":
                     await _ws_send(ws, {"type": "error", "text": f"unknown message type {mtype!r}"})
                     continue
