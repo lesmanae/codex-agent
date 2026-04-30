@@ -67,6 +67,16 @@ class CodexResult:
     stderr_tail: str = ""
     """Last lines of stderr — kept around so callers can detect rate-limit phrases."""
 
+    _pending_agent_msg: tuple[str, str] | None = None
+    """Internal: (item_id, text) of the most recent agent_message seen.
+
+    Codex CLI emits multiple ``agent_message`` items per turn — early ones
+    are 'preambles' (narration of what the model is about to do), the last
+    one is the user-visible final answer. We hold the latest one pending;
+    whenever a new agent_message arrives, the previous pending one is
+    flushed as a ``reasoning`` rich event (shows up in ThinkingBlock).
+    """
+
 
 def _short(s: str, n: int = 200) -> str:
     s = s.replace("\n", " ").strip()
@@ -395,10 +405,18 @@ async def _handle_event(
         return
     if etype == "turn.completed":
         result.usage = evt.get("usage")
+        # Flush the last pending agent_message as the final answer text.
+        if result._pending_agent_msg is not None:
+            final_chunks.append(result._pending_agent_msg[1])
+            result._pending_agent_msg = None
         return
     if etype in ("turn.failed", "error"):
         msg = evt.get("error", {}).get("message") if isinstance(evt.get("error"), dict) else evt.get("message")
         result.error = str(msg or evt)
+        # Still surface whatever partial answer we had.
+        if result._pending_agent_msg is not None:
+            final_chunks.append(result._pending_agent_msg[1])
+            result._pending_agent_msg = None
         return
 
     if etype not in ("item.started", "item.completed", "item.updated"):
@@ -408,11 +426,42 @@ async def _handle_event(
     itype = item.get("type", "")
     result.items.append(item)
 
-    # Final agent text
+    # Emit a compact log line per item so we can diagnose which item-types
+    # this Codex CLI version actually ships. Keeps only the keys, never the
+    # full body (which may be large).
+    logger.info(
+        "codex_item",
+        etype=etype,
+        itype=itype,
+        keys=sorted(list(item.keys()))[:20],
+    )
+
+    # Agent messages: the LAST one of the turn is the user-visible answer;
+    # all earlier ones are "preambles" (narration before/between tool calls)
+    # and are re-routed into the thinking stream so the UI can show what the
+    # model is about to do, rather than mixing the preamble into the final
+    # answer bubble.
     if etype == "item.completed" and itype == "agent_message":
         text = item.get("text") or item.get("message") or ""
-        if text:
-            final_chunks.append(text)
+        if not text:
+            return
+        item_id = item.get("id") or f"am_{int(time.time() * 1000)}"
+        prev = result._pending_agent_msg
+        result._pending_agent_msg = (item_id, text)
+        if prev is not None and on_event is not None:
+            prev_id, prev_text = prev
+            try:
+                await on_event({
+                    "type": "reasoning",
+                    "id": prev_id,
+                    "status": "ok",
+                    "text": prev_text,
+                    "ts": time.time(),
+                    "item": {"type": "agent_message", "id": prev_id},
+                    "source": "preamble",
+                })
+            except Exception:  # noqa: BLE001
+                pass
         return
 
     if on_event is not None:
@@ -498,12 +547,42 @@ def _to_rich_event(etype: str, itype: str, item: dict) -> dict | None:
         return base
 
     if itype == "reasoning":
-        text = item.get("text") or item.get("message") or item.get("summary") or ""
+        # Codex CLI has shipped reasoning text under several field names
+        # depending on version. Try everything we've seen in the wild.
+        text = (
+            item.get("text")
+            or item.get("message")
+            or item.get("summary")
+            or item.get("content")
+            or item.get("reasoning")
+            or item.get("thought")
+        )
+        # Some versions wrap the text in an array of content parts, e.g.
+        # [{"type": "text", "text": "..."}] or [{"text": "..."}].
+        if not text:
+            parts = item.get("parts") or item.get("content_parts")
+            if isinstance(parts, list):
+                chunks: list[str] = []
+                for p in parts:
+                    if isinstance(p, str):
+                        chunks.append(p)
+                    elif isinstance(p, dict):
+                        t = p.get("text") or p.get("content") or ""
+                        if t:
+                            chunks.append(str(t))
+                text = "\n".join(chunks) if chunks else None
+        logger.info(
+            "reasoning_item",
+            completed=completed,
+            has_text=bool(text),
+            keys=sorted(list(item.keys())),
+            preview=(str(text)[:80] if text else None),
+        )
         if not text:
             return None
         base["type"] = "reasoning"
         base["status"] = "ok" if completed else "running"
-        base["text"] = text
+        base["text"] = str(text)
         return base
 
     return None
