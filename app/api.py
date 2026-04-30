@@ -80,7 +80,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -325,7 +325,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="codex-agent", version="0.4.0", lifespan=_lifespan)
+    app = FastAPI(title="codex-agent", version="0.4.1", lifespan=_lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list(),
@@ -346,6 +346,26 @@ def _register_routes(app: FastAPI) -> None:
     @app.get("/api/health")
     async def health() -> dict:
         return {"ok": True, "version": app.version}
+
+    @app.get("/api/generated/{thread_id}/{filename}")
+    async def get_generated_image(thread_id: str, filename: str) -> FileResponse:
+        """Serve a PNG written by Codex CLI's built-in `image_gen` tool.
+
+        We don't require auth here because (a) the filename is an opaque
+        content-hash (ig_<sha>.png) that an attacker cannot guess, and (b)
+        mobile Image components don't send the Authorization header easily.
+        """
+        # Guard against path traversal.
+        if "/" in thread_id or "\\" in thread_id or ".." in thread_id:
+            raise HTTPException(status_code=400, detail="bad thread_id")
+        if "/" in filename or "\\" in filename or ".." in filename:
+            raise HTTPException(status_code=400, detail="bad filename")
+        if not (filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".webp")):
+            raise HTTPException(status_code=400, detail="bad extension")
+        host_path = Path("/host/root/.codex/generated_images") / thread_id / filename
+        if not host_path.is_file():
+            raise HTTPException(status_code=404, detail="not found")
+        return FileResponse(str(host_path), media_type="image/png")
 
     @app.get("/api/usage")
     async def get_usage(_: dict = Depends(require_token)) -> dict:

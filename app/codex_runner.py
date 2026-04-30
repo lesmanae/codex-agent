@@ -19,11 +19,17 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import structlog
 
 from . import codex_auth
+
+# Codex CLI's built-in `image_gen` tool writes PNGs here and emits NO tool_call
+# event for them. We scan the directory before + after each turn and surface
+# new files to the client as synthetic `image_gen` rich events.
+_GEN_IMG_ROOT = Path("/host/root/.codex/generated_images")
 
 logger = structlog.get_logger(__name__)
 
@@ -189,6 +195,16 @@ async def run_codex(
         if codex_home:
             env["CODEX_HOME"] = codex_home
 
+    # Snapshot existing generated images so we can detect ones the built-in
+    # image_gen tool creates during this turn.
+    pre_images: set[str] = set()
+    try:
+        if _GEN_IMG_ROOT.is_dir():
+            for p in _GEN_IMG_ROOT.glob("*/*.png"):
+                pre_images.add(str(p))
+    except Exception:  # noqa: BLE001
+        pre_images = set()
+
     logger.info("codex_spawn", cmd=cmd, prompt_chars=len(prompt))
 
     # Bump the StreamReader buffer well past asyncio's 64KB default so large
@@ -300,6 +316,52 @@ async def run_codex(
 
     if final_chunks:
         result.text = "\n".join(final_chunks).strip()
+
+    # Detect PNGs created by Codex's built-in `image_gen` tool during this
+    # turn and surface them to the client as synthetic image_gen events +
+    # a final markdown image tag so the UI renders them inline.
+    new_images: list[tuple[str, str]] = []  # (thread_id, filename)
+    try:
+        if _GEN_IMG_ROOT.is_dir():
+            for p in _GEN_IMG_ROOT.glob("*/*.png"):
+                if str(p) in pre_images:
+                    continue
+                thread_id = p.parent.name
+                new_images.append((thread_id, p.name))
+    except Exception:  # noqa: BLE001
+        pass
+
+    if new_images and on_event is not None:
+        for thread_id, fname in new_images:
+            url_path = f"/api/generated/{thread_id}/{fname}"
+            try:
+                await on_event({
+                    "type": "tool_call",
+                    "kind": "image_gen",
+                    "id": f"img_{fname}",
+                    "status": "ok",
+                    "ts": time.time(),
+                    "url_path": url_path,
+                    "thread_id": thread_id,
+                    "filename": fname,
+                    "item": {"type": "image_gen", "path": str(_GEN_IMG_ROOT / thread_id / fname)},
+                })
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Also append markdown image tags to the final answer so clients that
+    # only render text still see the image (and so history persistence keeps
+    # the reference).
+    if new_images:
+        image_md_lines = []
+        for thread_id, fname in new_images:
+            url_path = f"/api/generated/{thread_id}/{fname}"
+            image_md_lines.append(f"![generated image]({url_path})")
+        attach = "\n\n" + "\n\n".join(image_md_lines)
+        if result.text and not any(u[1] in result.text for u in new_images):
+            result.text = result.text.rstrip() + attach
+        elif not result.text:
+            result.text = attach.strip()
 
     # Rate-limit detection — error message OR stderr tail OR final text.
     haystack = " ".join(filter(None, [result.error or "", stderr_tail, result.text]))
