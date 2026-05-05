@@ -137,6 +137,9 @@ async def run_codex(
     timeout_seconds: int = 600,
     codex_home: str | None = None,
     use_nsenter: bool = True,
+    session_id: int | None = None,
+    agent_token: str | None = None,
+    agent_loopback_url: str | None = None,
 ) -> CodexResult:
     """Run a single Codex exec turn and return the final agent message.
 
@@ -175,6 +178,16 @@ async def run_codex(
     if extra_args:
         codex_cmd[2:2] = list(extra_args)
 
+    # Back-channel env vars exposed to the codex sandbox so agent CLI
+    # scripts (e.g. ``codex-ask-user``) can call back into the API.
+    backchannel_env: list[str] = []
+    if session_id is not None:
+        backchannel_env.append(f"CODEX_SESSION_ID={session_id}")
+    if agent_token:
+        backchannel_env.append(f"CODEX_AGENT_TOKEN={agent_token}")
+    if agent_loopback_url:
+        backchannel_env.append(f"CODEX_BACKEND_URL={agent_loopback_url}")
+
     if use_nsenter:
         env_assigns = []
         if codex_home:
@@ -184,6 +197,7 @@ async def run_codex(
             "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
             "env",
             *env_assigns,
+            *backchannel_env,
             "HOME=/root",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             *codex_cmd,
@@ -194,6 +208,9 @@ async def run_codex(
         env = os.environ.copy()
         if codex_home:
             env["CODEX_HOME"] = codex_home
+        for kv in backchannel_env:
+            k, _, v = kv.partition("=")
+            env[k] = v
 
     # Snapshot existing generated images so we can detect ones the built-in
     # image_gen tool creates during this turn.
@@ -398,6 +415,9 @@ async def run_codex_with_rotation(
     timeout_seconds: int = 600,
     codex_home: str | None = None,
     max_rotations: int = 5,
+    session_id: int | None = None,
+    agent_token: str | None = None,
+    agent_loopback_url: str | None = None,
 ) -> CodexResult:
     """Run codex; on rate-limit error, rotate to the next account and retry.
 
@@ -418,6 +438,9 @@ async def run_codex_with_rotation(
             extra_args=extra_args,
             timeout_seconds=timeout_seconds,
             codex_home=codex_home,
+            session_id=session_id,
+            agent_token=agent_token,
+            agent_loopback_url=agent_loopback_url,
         )
         if not result.rate_limited:
             try:

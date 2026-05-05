@@ -93,6 +93,7 @@ from .db import BotDB
 from .jailbreak import build_system_instruction
 from .skills import Skill, load_skills
 from .turn_bus import SessionBus, registry as turn_registry
+from .ask_user import ASK_USER
 
 logger = structlog.get_logger("api")
 
@@ -110,6 +111,10 @@ class AppState:
     settings: Settings
     db: BotDB
     skills: list[Skill]
+    # Random token regenerated each backend start; injected as
+    # CODEX_AGENT_TOKEN into codex subprocesses so back-channel scripts
+    # (ask_user, etc.) can authenticate without sharing the user's PIN.
+    agent_token: str = ""
 
     # Per-day usage rollup. Keys: "YYYY-MM-DD". Values: dict with
     # input_tokens / output_tokens / reasoning_tokens / total_turns.
@@ -286,6 +291,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     uvicorn runs the app on."""
     settings = get_settings()
     state.settings = settings
+    # Per-startup token used by codex subprocess back-channel scripts.
+    import secrets as _secrets
+    state.agent_token = _secrets.token_urlsafe(32)
 
     db = BotDB(settings.db_path, settings.encryption_secret)
     await db.connect()
@@ -325,7 +333,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="codex-agent", version="0.5.0", lifespan=_lifespan)
+    app = FastAPI(title="codex-agent", version="0.6.0", lifespan=_lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list(),
@@ -384,6 +392,81 @@ def _register_routes(app: FastAPI) -> None:
             }),
             "days": [{"date": d, **state.usage_by_day[d]} for d in days],
         }
+
+    # ------------------------------------------------------------------
+    # Interactive ask-user channel
+    # ------------------------------------------------------------------
+    # The agent's CLI script (`scripts/ask_user.py`) calls /start to open
+    # a multiple-choice question, then long-polls /wait for the answer.
+    # The mobile app calls /answer when the user taps a chip. /start +
+    # /wait require the per-startup CODEX_AGENT_TOKEN; /answer uses the
+    # normal user bearer token.
+
+    async def _require_agent_token(
+        x_agent_token: Annotated[str | None, Header(alias="X-Agent-Token")] = None,
+    ) -> None:
+        if not state.agent_token or x_agent_token != state.agent_token:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bad agent token")
+
+    class _AskUserStartIn(BaseModel):
+        session_id: int
+        question: str
+        options: list[str] = []
+        allow_multiple: bool = False
+        allow_freetext: bool = True
+
+    @app.post("/api/ask-user/start")
+    async def ask_user_start(
+        body: _AskUserStartIn,
+        _: None = Depends(_require_agent_token),
+    ) -> dict:
+        if not body.question.strip():
+            raise HTTPException(400, "question required")
+        bus = await turn_registry.get(body.session_id)
+        pq = await ASK_USER.start(
+            session_id=body.session_id,
+            question=body.question,
+            options=body.options,
+            allow_multiple=body.allow_multiple,
+            allow_freetext=body.allow_freetext,
+        )
+        await bus.publish({
+            "type": "ask_user",
+            "id": pq.id,
+            "question": pq.question,
+            "options": pq.options,
+            "allow_multiple": pq.allow_multiple,
+            "allow_freetext": pq.allow_freetext,
+        })
+        return {"ok": True, "id": pq.id}
+
+    @app.post("/api/ask-user/wait")
+    async def ask_user_wait(
+        body: dict,
+        _: None = Depends(_require_agent_token),
+    ) -> dict:
+        qid = str(body.get("id") or "").strip()
+        if not qid:
+            raise HTTPException(400, "id required")
+        timeout = float(body.get("timeout") or 290.0)
+        answer = await ASK_USER.wait(qid, timeout=min(timeout, 290.0))
+        if answer is None:
+            return {"ok": True, "pending": True}
+        return {"ok": True, "pending": False, "answer": answer}
+
+    class _AskUserAnswerIn(BaseModel):
+        id: str
+        answer: str
+
+    @app.post("/api/ask-user/answer")
+    async def ask_user_answer(
+        body: _AskUserAnswerIn,
+        _: dict = Depends(require_token),
+    ) -> dict:
+        ok = await ASK_USER.answer(body.id.strip(), body.answer)
+        if not ok:
+            raise HTTPException(404, "question not pending")
+        return {"ok": True}
 
     @app.get("/api/info")
     async def info() -> dict:
@@ -844,6 +927,10 @@ def _register_routes(app: FastAPI) -> None:
                     await _ws_send(ws, {"type": "pong"})
                     continue
                 if mtype == "interrupt":
+                    # Also wake up any pending ask_user the agent is blocked on,
+                    # otherwise the codex script keeps long-polling and the
+                    # task.cancel() below is delayed until next subprocess I/O.
+                    await ASK_USER.cancel_for_session(session_id)
                     if bus.task is not None and not bus.task.done():
                         bus.task.cancel()
                         await _ws_send(ws, {"type": "info", "text": "turn dibatalkan"})
@@ -1074,6 +1161,9 @@ async def _run_user_turn(
             extra_args=extra_codex_args,
             timeout_seconds=settings.codex_timeout_seconds,
             codex_home=settings.codex_home,
+            session_id=session_id,
+            agent_token=state.agent_token,
+            agent_loopback_url=settings.agent_loopback_url,
         )
     except asyncio.CancelledError:
         await bus.publish({"type": "task_status", "status": "idle", "label": None})
