@@ -325,7 +325,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="codex-agent", version="0.4.1", lifespan=_lifespan)
+    app = FastAPI(title="codex-agent", version="0.5.0", lifespan=_lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list(),
