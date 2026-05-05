@@ -280,12 +280,16 @@ optional or you hit an unrecoverable error.
 
 
 def build_system_instruction(skills: list[Skill], extra: str | None = None) -> str:
+    from .skills import render_skills_index
+
     parts = [SYSTEM_PERSONA.rstrip()]
     if skills:
         parts.append("\n---\n")
-        parts.append("# Loaded skills\n")
-        for s in skills:
-            parts.append(s.render_system_section(include_references=True))
+        # With many skills (the full claude-skills library), inline injection
+        # of every SKILL.md body would blow the context budget. We inject a
+        # compact INDEX (name + description + on-disk path) instead and the
+        # agent reads bodies on demand via ``cat /app/skills/<name>/SKILL.md``.
+        parts.append(render_skills_index(skills))
     if extra:
         parts.append("\n---\n# User-supplied addendum\n" + extra.strip())
     return "\n\n".join(parts)
