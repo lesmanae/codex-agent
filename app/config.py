@@ -83,6 +83,16 @@ class Settings(BaseSettings):
     # `/:/host` defined in docker-compose. Surfaced via `GET /api/info`.
     public_url_file: Path = Path("/host/var/lib/codex-agent/tunnel.url")
 
+    # ---- Agent-side back-channel (ask_user, etc.) --------------------------
+    # The agent CLI scripts running inside Codex's sandbox call back into
+    # this process for interactive features (e.g. ``ask_user``). They
+    # authenticate with an in-process token derived per-startup; the same
+    # value is exported as ``CODEX_AGENT_TOKEN`` to the codex subprocess.
+    agent_loopback_url: str = "http://127.0.0.1:8001"
+    """URL the agent scripts hit to talk back to the backend. The container
+    listens on this address inside the host's network namespace (via
+    nsenter) so 127.0.0.1 works."""
+
     def cors_origin_list(self) -> list[str]:
         raw = (self.cors_origins or "").strip()
         if not raw or raw == "*":
