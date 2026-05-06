@@ -308,7 +308,12 @@ optional or you hit an unrecoverable error.
 """
 
 
-def build_system_instruction(skills: list[Skill], extra: str | None = None) -> str:
+def build_system_instruction(
+    skills: list[Skill],
+    extra: str | None = None,
+    *,
+    skills_host_path: str = "/opt/codex-agent/skills",
+) -> str:
     from .skills import render_skills_index
 
     parts = [SYSTEM_PERSONA.rstrip()]
@@ -317,8 +322,12 @@ def build_system_instruction(skills: list[Skill], extra: str | None = None) -> s
         # With many skills (the full claude-skills library), inline injection
         # of every SKILL.md body would blow the context budget. We inject a
         # compact INDEX (name + description + on-disk path) instead and the
-        # agent reads bodies on demand via ``cat /app/skills/<name>/SKILL.md``.
-        parts.append(render_skills_index(skills))
+        # agent reads bodies on demand via ``cat <host-path>/<name>/SKILL.md``.
+        # NOTE: the API container loads skills from /app/skills, but the
+        # Codex CLI runs in the HOST mount namespace via nsenter and only
+        # sees /opt/codex-agent/skills, so we always render with the host
+        # path here.
+        parts.append(render_skills_index(skills, container_path=skills_host_path))
     if extra:
         parts.append("\n---\n# User-supplied addendum\n" + extra.strip())
     return "\n\n".join(parts)

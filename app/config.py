@@ -42,6 +42,15 @@ class Settings(BaseSettings):
 
     db_path: Path = Path("/data/bot.sqlite")
     skills_dir: Path = Path("/app/skills")
+    """Path INSIDE the API container where SKILL.md files are mounted.
+    Used by the API to load + serve skills."""
+
+    skills_host_path: Path = Path("/opt/codex-agent/skills")
+    """Path on the HOST filesystem where SKILL.md files live. The Codex
+    CLI subprocess runs in the host's mount namespace via nsenter, so it
+    cannot see the container path; we tell the agent to `cat` from this
+    path instead. Override with SKILLS_HOST_PATH env var if you cloned
+    the repo somewhere other than /opt/codex-agent."""
 
     log_level: str = "INFO"
 
