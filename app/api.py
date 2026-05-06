@@ -493,20 +493,26 @@ def _register_routes(app: FastAPI) -> None:
             return {"ok": True, "pending": True}
         return {"ok": True, "pending": False, "answer": answer}
 
-    class _AskUserAnswerIn(BaseModel):
-        id: str
-        # Accept either a simple string or a list (for multi-select); we
-        # join lists with ", " so the agent gets one readable answer line.
-        answer: str | list[str]
-
     @app.post("/api/ask-user/answer")
     async def ask_user_answer(
-        body: _AskUserAnswerIn,
+        body: dict,
         _: dict = Depends(require_token),
     ) -> dict:
-        if isinstance(body.answer, list):
-            body.answer = ", ".join(str(x) for x in body.answer if str(x).strip())
-        ok = await ASK_USER.answer(body.id.strip(), body.answer)
+        # ``body: dict`` (rather than a local BaseModel) — under
+        # ``from __future__ import annotations``, FastAPI can't resolve a
+        # locally-scoped Pydantic class and falls back to treating the
+        # parameter as a query string, which produced 422s in v0.6.0.
+        qid = str(body.get("id") or "").strip()
+        if not qid:
+            raise HTTPException(400, "id required")
+        raw_ans = body.get("answer")
+        if isinstance(raw_ans, list):
+            answer = ", ".join(str(x) for x in raw_ans if str(x).strip())
+        else:
+            answer = str(raw_ans or "").strip()
+        if not answer:
+            raise HTTPException(400, "answer required")
+        ok = await ASK_USER.answer(qid, answer)
         if not ok:
             raise HTTPException(404, "question not pending")
         return {"ok": True}
