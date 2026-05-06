@@ -333,7 +333,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="codex-agent", version="0.7.0", lifespan=_lifespan)
+    app = FastAPI(title="codex-agent", version="0.7.2", lifespan=_lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list(),
@@ -1398,7 +1398,10 @@ async def _run_user_turn(
     # Drop the just-appended message — codex_runner adds it back via user_text
     if history and history[-1]["role"] == "user":
         history = history[:-1]
-    system_instruction = build_system_instruction(state.skills)
+    system_instruction = build_system_instruction(
+        state.skills,
+        skills_host_path=str(settings.skills_host_path),
+    )
 
     async def _on_progress(text: str) -> None:
         await bus.publish({"type": "progress", "text": text})
