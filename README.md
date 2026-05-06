@@ -120,7 +120,7 @@ docker compose logs -f api
 
 ```bash
 curl -sf http://127.0.0.1:8001/api/health
-# → {"ok":true,"version":"0.7.1"}
+# → {"ok":true,"version":"0.8.0"}
 ```
 
 If you see `{"ok":true,...}` the API is up. Now expose it (see
@@ -186,6 +186,7 @@ Plus rate limit. The mobile app exposes this same flow under
 | `GET`  | `/api/skills` | List skills (240 by default) |
 | `GET`  | `/api/workspace/tree?path=&depth=` | Browse the agent's filesystem |
 | `GET`  | `/api/workspace/file?path=` | Read a file (256 KB cap) |
+| `POST` | `/api/workspace/file` | Write a file (≤ 1 MiB; optimistic concurrency via `expected_size`) |
 | `GET`  | `/api/workspace/git/status?path=` | Git status (porcelain) |
 | `GET`  | `/api/workspace/git/diff?path=&staged=` | Unified diff |
 | `POST` | `/api/ask-user/start` | Agent → register a question (X-Agent-Token) |

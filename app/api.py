@@ -19,6 +19,14 @@ Exposes REST + WebSocket endpoints used by the Android (or any) client:
     POST /api/sessions/{id}/messages/clear — wipe history
     POST /api/sessions/{id}/uploads        — upload one or more files
 
+  Workspace files (read-only browser added in 0.7.0; write-back in 0.8.0)
+    GET  /api/workspace/tree?path=&depth=  — list a folder
+    GET  /api/workspace/file?path=         — read a file (truncated >256 KiB)
+    POST /api/workspace/file               — write a file (≤ 1 MiB, optimistic
+                                             concurrency via ``expected_size``)
+    GET  /api/workspace/git/status?path=
+    GET  /api/workspace/git/diff?path=&staged=
+
   Codex accounts
     GET    /api/codex/accounts                    — list with active/exhausted status
     POST   /api/codex/accounts/{name}/activate    — swap auth.json to this account
@@ -333,7 +341,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="codex-agent", version="0.7.2", lifespan=_lifespan)
+    app = FastAPI(title="codex-agent", version="0.8.0", lifespan=_lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list(),
@@ -538,6 +546,18 @@ def _register_routes(app: FastAPI) -> None:
             "version": app.version,
             "public_url": public_url,
             "stream_schema_version": 2,
+            # Capability flags so the mobile client can hide UI for
+            # features the backend doesn't yet expose. Older backends
+            # simply omit this key — mobile treats absent as false.
+            "features": {
+                "workspace_write": True,
+                "desktop": True,
+            },
+            # Relative path the noVNC WebView should load. Mobile joins
+            # this with ``public_url`` (or its configured base URL) to
+            # build the full URL. None if the backend hasn't been set
+            # up for desktop control yet.
+            "desktop_path": "/vnc/vnc.html?autoconnect=1&resize=scale&path=websockify",
         }
 
     # ------ workspace files (read-only browser) -------------------------
@@ -651,6 +671,92 @@ def _register_routes(app: FastAPI) -> None:
             "truncated": False,
             "content": content,
             "binary": binary,
+        }
+
+    # ------ workspace file write-back (added in v0.8.0) -----------------
+    #
+    # Mobile FileEditorScreen (and any other client) submits an entire
+    # text file body here. Optimistic concurrency: clients pass the
+    # ``expected_size`` they observed when reading; if the file on disk
+    # has changed since, we 409 instead of clobbering. Hard 1 MiB cap
+    # for safety — the read endpoint truncates at 256 KiB so legitimate
+    # editor flows are well under this.
+    #
+    # NOTE: deliberately ``body: dict`` + manual parsing rather than a
+    # locally-scoped Pydantic model. Under ``from __future__ import
+    # annotations`` (PEP 563), Pydantic's ``model_rebuild`` cannot
+    # resolve forward references for classes defined inside this
+    # closure, which makes every request 422. See §10.1 in the
+    # architecture handoff.
+    _FILE_WRITE_MAX_BYTES = 1024 * 1024  # 1 MiB
+
+    @app.post("/api/workspace/file")
+    async def workspace_file_write(
+        body: dict,
+        _: dict = Depends(require_token),
+    ) -> dict:
+        rel = body.get("path")
+        content = body.get("content")
+        if not isinstance(rel, str) or not rel.strip():
+            raise HTTPException(400, "path required")
+        if not isinstance(content, str):
+            raise HTTPException(400, "content must be a string")
+        expected_size = body.get("expected_size")
+        if expected_size is not None and not isinstance(expected_size, int):
+            raise HTTPException(400, "expected_size must be int|null")
+        create = bool(body.get("create", False))
+
+        target = _resolve_workspace_path(rel)
+        # Refuse to clobber a directory with a file write.
+        if target.exists() and target.is_dir():
+            raise HTTPException(400, "path is a directory")
+
+        # Optimistic concurrency: if the caller saw size=N on read, fail
+        # if the on-disk size has shifted (someone else edited it, or
+        # the file was deleted). expected_size=-1 means "did not exist
+        # when I read it". expected_size=None disables the check.
+        if expected_size is not None:
+            current_size = target.stat().st_size if target.exists() else -1
+            if current_size != expected_size:
+                raise HTTPException(
+                    409,
+                    f"file changed since read (was size={expected_size}, "
+                    f"now size={current_size})",
+                )
+
+        if not target.exists() and not create:
+            raise HTTPException(404, "file not found (pass create=true to create new)")
+
+        data = content.encode("utf-8")
+        if len(data) > _FILE_WRITE_MAX_BYTES:
+            raise HTTPException(413, "content too large (>1 MiB)")
+
+        # Refuse path traversal that escaped the workspace check by
+        # symlinking into it after the resolve. Re-resolve & re-check
+        # under the live filesystem state.
+        ws_root = _resolve_workspace_path("")
+        try:
+            target.resolve().relative_to(ws_root)
+        except ValueError:
+            raise HTTPException(400, "path escapes workspace")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write: write to a sibling tempfile then rename, so a
+        # mid-write power loss never leaves a half-written file.
+        tmp = target.with_suffix(target.suffix + ".codex-agent.tmp")
+        try:
+            tmp.write_bytes(data)
+            tmp.replace(target)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                tmp.unlink()
+
+        new_size = target.stat().st_size
+        return {
+            "ok": True,
+            "path": rel,
+            "size": new_size,
+            "created": expected_size == -1 or expected_size is None and create,
         }
 
     # ------ git status & diff (workspace) -------------------------------

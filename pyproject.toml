@@ -1,6 +1,6 @@
 [project]
 name = "codex-agent"
-version = "0.4.0"
+version = "0.8.0"
 description = "Codex-CLI-powered HTTP/WebSocket agent backend (Android client, multi-account ChatGPT Plus auth, multi-modal input, threads, voice transcription)"
 requires-python = ">=3.12"
 dependencies = [
