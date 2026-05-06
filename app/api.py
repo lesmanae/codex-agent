@@ -341,6 +341,25 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Log validation errors with the raw body so we can debug agent-side
+    # callers like ``codex-ask-user`` whose stderr we don't always capture.
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse as _JSONResponse
+
+    @app.exception_handler(RequestValidationError)
+    async def _on_validation_error(req, exc: RequestValidationError):  # type: ignore[no-redef]
+        try:
+            raw = (await req.body()).decode("utf-8", errors="replace")[:2000]
+        except Exception:  # noqa: BLE001
+            raw = "<unreadable>"
+        logger.warning(
+            "request_validation_error",
+            path=str(req.url.path),
+            errors=exc.errors(),
+            body=raw,
+        )
+        return _JSONResponse(status_code=422, content={"detail": exc.errors()})
+
     _register_routes(app)
     return app
 
@@ -408,27 +427,47 @@ def _register_routes(app: FastAPI) -> None:
         if not state.agent_token or x_agent_token != state.agent_token:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bad agent token")
 
-    class _AskUserStartIn(BaseModel):
-        session_id: int
-        question: str
-        options: list[str] = []
-        allow_multiple: bool = False
-        allow_freetext: bool = True
-
     @app.post("/api/ask-user/start")
     async def ask_user_start(
-        body: _AskUserStartIn,
+        body: dict,
         _: None = Depends(_require_agent_token),
     ) -> dict:
-        if not body.question.strip():
+        # Accept loose payloads — the agent CLI may stringify ints, miss
+        # boolean flags, or send ``options`` as a JSON-encoded string.
+        try:
+            session_id = int(body.get("session_id") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "session_id must be an integer")
+        if session_id <= 0:
+            raise HTTPException(400, "session_id required")
+        question = str(body.get("question") or "").strip()
+        if not question:
             raise HTTPException(400, "question required")
-        bus = await turn_registry.get(body.session_id)
+        raw_opts = body.get("options")
+        if isinstance(raw_opts, str):
+            # Tolerate "a,b,c" or JSON-encoded list strings.
+            stripped = raw_opts.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    raw_opts = json.loads(stripped)
+                except Exception:  # noqa: BLE001
+                    raw_opts = [p for p in stripped.strip("[]").split(",")]
+            else:
+                raw_opts = [p for p in stripped.split(",")]
+        if not isinstance(raw_opts, list):
+            raw_opts = []
+        options = [str(o).strip() for o in raw_opts if str(o).strip()]
+        allow_multiple = bool(body.get("allow_multiple") or False)
+        allow_freetext_v = body.get("allow_freetext")
+        allow_freetext = True if allow_freetext_v is None else bool(allow_freetext_v)
+
+        bus = await turn_registry.get(session_id)
         pq = await ASK_USER.start(
-            session_id=body.session_id,
-            question=body.question,
-            options=body.options,
-            allow_multiple=body.allow_multiple,
-            allow_freetext=body.allow_freetext,
+            session_id=session_id,
+            question=question,
+            options=options,
+            allow_multiple=allow_multiple,
+            allow_freetext=allow_freetext,
         )
         await bus.publish({
             "type": "ask_user",
@@ -456,13 +495,17 @@ def _register_routes(app: FastAPI) -> None:
 
     class _AskUserAnswerIn(BaseModel):
         id: str
-        answer: str
+        # Accept either a simple string or a list (for multi-select); we
+        # join lists with ", " so the agent gets one readable answer line.
+        answer: str | list[str]
 
     @app.post("/api/ask-user/answer")
     async def ask_user_answer(
         body: _AskUserAnswerIn,
         _: dict = Depends(require_token),
     ) -> dict:
+        if isinstance(body.answer, list):
+            body.answer = ", ".join(str(x) for x in body.answer if str(x).strip())
         ok = await ASK_USER.answer(body.id.strip(), body.answer)
         if not ok:
             raise HTTPException(404, "question not pending")
