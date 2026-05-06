@@ -656,12 +656,15 @@ def _register_routes(app: FastAPI) -> None:
     # ------ git status & diff (workspace) -------------------------------
 
     async def _run_git(args: list[str], cwd: Path, timeout: float = 10.0) -> tuple[int, str, str]:
-        proc = await asyncio.create_subprocess_exec(
-            "git", *args,
-            cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *args,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return 127, "", "git binary not found"
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:

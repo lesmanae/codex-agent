@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iputils-ping \
         dnsutils \
         less \
+        git \
         ffmpeg \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
