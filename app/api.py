@@ -333,7 +333,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="codex-agent", version="0.6.0", lifespan=_lifespan)
+    app = FastAPI(title="codex-agent", version="0.7.0", lifespan=_lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list(),
@@ -539,6 +539,229 @@ def _register_routes(app: FastAPI) -> None:
             "public_url": public_url,
             "stream_schema_version": 2,
         }
+
+    # ------ workspace files (read-only browser) -------------------------
+    #
+    # Backed by the codex workspace folder configured at startup. We refuse
+    # path traversal, symlinks that escape, and binary blobs over 256KB.
+
+    _FILE_MAX_BYTES = 256 * 1024
+    _IGNORED_DIRS = {".git", "node_modules", ".venv", "__pycache__", ".cache",
+                     "dist", "build", ".next", ".turbo", "target"}
+
+    def _resolve_workspace_path(rel: str) -> Path:
+        root = state.settings.codex_workdir.resolve()
+        # Inside the container the host workspace is mounted at /host/...
+        # so we re-anchor reads through that prefix when present.
+        host_view = Path("/host") / str(root).lstrip("/")
+        base = host_view if host_view.is_dir() else root
+        rel_clean = (rel or "").lstrip("/")
+        target = (base / rel_clean).resolve()
+        # Refuse anything that escapes the base via .. or symlinks.
+        try:
+            target.relative_to(base)
+        except ValueError:
+            raise HTTPException(400, "path escapes workspace")
+        return target
+
+    @app.get("/api/workspace/tree")
+    async def workspace_tree(
+        path: str = "",
+        depth: int = 1,
+        _: dict = Depends(require_token),
+    ) -> dict:
+        depth = max(0, min(int(depth or 1), 4))
+        root = _resolve_workspace_path(path)
+        if not root.exists():
+            raise HTTPException(404, "path not found")
+        if not root.is_dir():
+            raise HTTPException(400, "not a directory")
+
+        def _walk(p: Path, d: int) -> list[dict]:
+            entries: list[dict] = []
+            try:
+                items = sorted(
+                    p.iterdir(),
+                    key=lambda e: (not e.is_dir(), e.name.lower()),
+                )
+            except PermissionError:
+                return entries
+            for entry in items:
+                if entry.name in _IGNORED_DIRS:
+                    continue
+                # follow_symlinks=False is_dir per stat to avoid loops
+                try:
+                    is_dir = entry.is_dir()
+                    size = entry.stat().st_size if not is_dir else 0
+                    mtime = int(entry.stat().st_mtime)
+                except OSError:
+                    continue
+                node = {
+                    "name": entry.name,
+                    "path": str(entry.relative_to(_resolve_workspace_path(""))),
+                    "is_dir": is_dir,
+                    "size": size,
+                    "mtime": mtime,
+                }
+                if is_dir and d > 0:
+                    node["children"] = _walk(entry, d - 1)
+                entries.append(node)
+            return entries
+
+        return {
+            "ok": True,
+            "path": path or "",
+            "entries": _walk(root, depth - 1) if depth > 0 else [],
+        }
+
+    @app.get("/api/workspace/file")
+    async def workspace_file(
+        path: str,
+        _: dict = Depends(require_token),
+    ) -> dict:
+        target = _resolve_workspace_path(path)
+        if not target.is_file():
+            raise HTTPException(404, "file not found")
+        size = target.stat().st_size
+        if size > _FILE_MAX_BYTES:
+            return {
+                "ok": True,
+                "path": path,
+                "size": size,
+                "truncated": True,
+                "content": "",
+                "binary": True,
+            }
+        try:
+            content = target.read_text(encoding="utf-8")
+            binary = False
+        except UnicodeDecodeError:
+            return {
+                "ok": True,
+                "path": path,
+                "size": size,
+                "truncated": False,
+                "content": "",
+                "binary": True,
+            }
+        return {
+            "ok": True,
+            "path": path,
+            "size": size,
+            "truncated": False,
+            "content": content,
+            "binary": binary,
+        }
+
+    # ------ git status & diff (workspace) -------------------------------
+
+    async def _run_git(args: list[str], cwd: Path, timeout: float = 10.0) -> tuple[int, str, str]:
+        proc = await asyncio.create_subprocess_exec(
+            "git", *args,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return 124, "", "git timeout"
+        return proc.returncode or 0, out.decode("utf-8", errors="replace"), err.decode("utf-8", errors="replace")
+
+    def _resolve_git_root(rel_path: str) -> Path:
+        # Find the nearest .git ancestor for the given relative path inside
+        # the workspace. If none, default to the workspace root.
+        target = _resolve_workspace_path(rel_path)
+        if target.is_file():
+            target = target.parent
+        cur = target
+        ws_root = _resolve_workspace_path("")
+        while True:
+            if (cur / ".git").exists():
+                return cur
+            if cur == ws_root or cur.parent == cur:
+                return ws_root
+            cur = cur.parent
+
+    @app.get("/api/workspace/git/status")
+    async def git_status(
+        path: str = "",
+        _: dict = Depends(require_token),
+    ) -> dict:
+        root = _resolve_git_root(path)
+        if not (root / ".git").exists():
+            return {"ok": True, "is_repo": False, "root": "", "files": [], "branch": ""}
+        rc, out, _err = await _run_git(["status", "--porcelain=v1", "-z"], root)
+        if rc != 0:
+            return {"ok": True, "is_repo": True, "root": str(root), "files": [], "branch": ""}
+        files: list[dict] = []
+        # `-z`: fields are NUL-separated; renames take TWO records (new\0old).
+        tokens = out.split("\x00")
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            i += 1
+            if not tok:
+                continue
+            if len(tok) < 4:
+                continue
+            xy = tok[:2]
+            name = tok[3:]
+            if xy[0] == "R" or xy[1] == "R":
+                # next token is the old name
+                if i < len(tokens):
+                    old = tokens[i]
+                    i += 1
+                    files.append({"status": xy, "path": name, "old_path": old})
+                    continue
+            files.append({"status": xy, "path": name})
+        rc_b, branch_out, _ = await _run_git(["rev-parse", "--abbrev-ref", "HEAD"], root)
+        branch = branch_out.strip() if rc_b == 0 else ""
+        ws_root = _resolve_workspace_path("")
+        try:
+            rel_root = str(root.relative_to(ws_root))
+        except ValueError:
+            rel_root = ""
+        return {
+            "ok": True,
+            "is_repo": True,
+            "root": rel_root,
+            "branch": branch,
+            "files": files,
+        }
+
+    @app.get("/api/workspace/git/diff")
+    async def git_diff(
+        path: str = "",
+        staged: bool = False,
+        max_bytes: int = 200_000,
+        _: dict = Depends(require_token),
+    ) -> dict:
+        root = _resolve_git_root(path)
+        if not (root / ".git").exists():
+            return {"ok": True, "is_repo": False, "diff": "", "truncated": False}
+        args = ["diff", "--no-color"]
+        if staged:
+            args.append("--cached")
+        # Restrict to a single file if a non-empty file path was given.
+        if path:
+            target = _resolve_workspace_path(path)
+            if target.exists() and target.is_file():
+                try:
+                    rel = target.relative_to(root)
+                    args += ["--", str(rel)]
+                except ValueError:
+                    pass
+        rc, out, _err = await _run_git(args, root, timeout=15.0)
+        if rc != 0:
+            return {"ok": True, "is_repo": True, "diff": "", "truncated": False}
+        truncated = False
+        max_bytes = max(10_000, min(int(max_bytes or 200_000), 1_000_000))
+        if len(out) > max_bytes:
+            out = out[:max_bytes]
+            truncated = True
+        return {"ok": True, "is_repo": True, "diff": out, "truncated": truncated}
 
     # ------ auth ----------------------------------------------------------
 
